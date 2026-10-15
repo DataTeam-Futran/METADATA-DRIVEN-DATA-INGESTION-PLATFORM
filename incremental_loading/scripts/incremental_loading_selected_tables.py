@@ -162,7 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Only the selected tables will be loaded.")
     print("=" * 72)
 
-    tables_loaded = 0
+    loaded_tables: list[str] = []
     rows_appended = 0
     failures: list[tuple[str, str]] = []
     for table_name in selected_tables:
@@ -173,7 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 table_name,
                 display_columns_and_data=False,
             )
-            tables_loaded += 1
+            loaded_tables.append(table_name)
             rows_appended += table_rows_appended
         except Exception as error:
             failures.append((table_name, str(error)))
@@ -184,7 +184,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         [
             ("Tables discovered in source", len(source_tables)),
             ("Tables selected for incremental loading", len(selected_tables)),
-            ("Tables loaded successfully into target", tables_loaded),
+            (
+                f"Tables loaded successfully into target ({len(loaded_tables)})",
+                ", ".join(loaded_tables) or "None",
+            ),
             ("Rows appended to target tables", rows_appended),
         ],
     )
