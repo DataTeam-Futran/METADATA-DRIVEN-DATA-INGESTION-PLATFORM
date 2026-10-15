@@ -62,3 +62,28 @@ versions, not updated in place. The report shows mapping and row counts for
 each table, aggregate counts, and the target table contents. Unsupported source
 PostgreSQL types or other per-table failures are reported, and the run
 continues with the remaining tables before returning a failure status.
+
+## Select Specific Source Tables
+
+To list the source tables without loading data:
+
+```powershell
+..\.venv\Scripts\python.exe -m incremental_loading.scripts.incremental_loading_selected_tables --list-tables
+```
+
+To select tables interactively, run the command without options. Enter one or
+more displayed table numbers separated by commas:
+
+```powershell
+..\.venv\Scripts\python.exe -m incremental_loading.scripts.incremental_loading_selected_tables
+```
+
+You can also specify exact table names on the command line:
+
+```powershell
+..\.venv\Scripts\python.exe -m incremental_loading.scripts.incremental_loading_selected_tables --tables customer department
+```
+
+Only the selected source tables are passed to the incremental append workflow.
+The same watermark, target-table setup, and append behavior as the multi-table
+demo is used for each selected table.

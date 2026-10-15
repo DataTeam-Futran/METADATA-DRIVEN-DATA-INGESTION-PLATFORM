@@ -36,6 +36,26 @@ The target connection supplies the host and credentials. The runner overrides
 its database name with `demo_target_db`; credentials are not stored in this
 script.
 
+## Select Specific Source Tables
+
+List the available source tables without loading any data:
+
+```powershell
+..\.venv\Scripts\python.exe -m incremental_loading.scripts.incremental_loading_selected_tables --list-tables
+```
+
+Run without options to display a numbered table list and select one or more
+tables interactively, for example `1,3`. To choose exact table names without
+the prompt, pass them with `--tables`:
+
+```powershell
+..\.venv\Scripts\python.exe -m incremental_loading.scripts.incremental_loading_selected_tables --tables customer department
+```
+
+The selected-table runner invokes the same per-table incremental append
+workflow as the multi-table demo, but only for the selected source tables.
+Tables not selected are not created, altered, or loaded in the target.
+
 ## Example Tables and Column Mapping
 
 The source database was inspected during development and contained these

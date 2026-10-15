@@ -347,7 +347,8 @@ def run_table(
     source_connector: Any,
     target_connector: Any,
     table_name: str,
-) -> tuple[int, int, int]:
+    display_columns_and_data: bool = True,
+) -> tuple[int, int, int | None]:
     """Run one table's setup, incremental append, and target report."""
     source_connector.connect()
     target_connector.connect()
@@ -402,7 +403,8 @@ def run_table(
                 ("Table", table_name),
             ],
         )
-        print_mapping_section(mapping)
+        if display_columns_and_data:
+            print_mapping_section(mapping)
     finally:
         source_connector.close()
         target_connector.close()
@@ -428,11 +430,17 @@ def run_table(
         ],
     )
 
-    target_connector.connect()
-    try:
-        target_rows = print_target_table(target_connector, table_name, target_columns)
-    finally:
-        target_connector.close()
+    target_rows = None
+    if display_columns_and_data:
+        target_connector.connect()
+        try:
+            target_rows = print_target_table(
+                target_connector,
+                table_name,
+                target_columns,
+            )
+        finally:
+            target_connector.close()
     return executor.source_rows_read, rows_appended, target_rows
 
 
