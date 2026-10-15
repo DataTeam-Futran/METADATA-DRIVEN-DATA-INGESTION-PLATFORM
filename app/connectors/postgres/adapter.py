@@ -56,7 +56,7 @@ from __future__ import annotations
 
 # Iterator is used by read_batches() because the method yields batches
 # incrementally rather than loading the complete source dataset.
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 # Any is used for dynamically typed metadata values such as connection
 # parameters and database result values.
@@ -886,6 +886,7 @@ class PostgreSQLConnector(BaseConnector):
         self,
         query: str,
         batch_size: int = 1000,
+        parameters: Sequence[Any] | None = None,
     ) -> Iterator[list[tuple[Any, ...]]]:
         """
         Read source data in controlled batches.
@@ -963,8 +964,11 @@ class PostgreSQLConnector(BaseConnector):
                 name=cursor_name,
             ) as cursor:
 
-                # Execute the source extraction query.
-                cursor.execute(query)
+                # Keep watermark values parameterized when supplied.
+                if parameters is None:
+                    cursor.execute(query)
+                else:
+                    cursor.execute(query, parameters)
 
                 # Continue fetching until the source is exhausted.
                 while True:
@@ -1007,6 +1011,8 @@ class PostgreSQLConnector(BaseConnector):
         target_table: str,
         column_names: list[str],
         rows: list[tuple[Any, ...]],
+        duplicate_strategy: str = "ALLOW",
+        primary_key_columns: list[str] | None = None,
     ) -> int:
         """
         Write one batch of rows into a PostgreSQL target table.
@@ -1080,6 +1086,21 @@ class PostgreSQLConnector(BaseConnector):
                     "Target column names must not be empty."
                 )
 
+        duplicate_strategy = duplicate_strategy.upper()
+        if duplicate_strategy not in {"ALLOW", "SKIP", "FAIL"}:
+            raise ValueError(
+                "duplicate_strategy must be ALLOW, SKIP, or FAIL."
+            )
+        if duplicate_strategy == "SKIP":
+            if not primary_key_columns:
+                raise ValueError(
+                    "primary_key_columns are required for SKIP duplicates."
+                )
+            if any(column not in column_names for column in primary_key_columns):
+                raise ValueError(
+                    "All primary-key columns must be present in column_names."
+                )
+
         # -----------------------------------------------------
         # Handle empty batch
         # -----------------------------------------------------
@@ -1149,6 +1170,14 @@ class PostgreSQLConnector(BaseConnector):
             f"({quoted_columns}) "
             f"VALUES ({placeholders})"
         )
+        if duplicate_strategy == "SKIP":
+            quoted_primary_key = ", ".join(
+                self._quote_identifier(column)
+                for column in primary_key_columns or []
+            )
+            insert_query += (
+                f" ON CONFLICT ({quoted_primary_key}) DO NOTHING"
+            )
 
         # -----------------------------------------------------
         # Execute batch
@@ -1164,6 +1193,7 @@ class PostgreSQLConnector(BaseConnector):
                 insert_query,
                 rows,
             )
+            rows_written = cursor.rowcount
 
         # -----------------------------------------------------
         # Return batch count
@@ -1171,7 +1201,7 @@ class PostgreSQLConnector(BaseConnector):
 
         # The execution engine uses this value for runtime metrics,
         # reconciliation, and logging.
-        return len(rows)
+        return rows_written
 
         # =========================================================
     # TRANSACTION MANAGEMENT

@@ -40,6 +40,8 @@ The connector type is determined from metadata using the connector_code
 stored in the metadata database.
 """
 
+from dataclasses import replace
+
 from app.connectors.base import BaseConnector
 from app.connectors.factory import ConnectorFactory
 from app.connectors.register_connectors import create_connector_registry
@@ -101,7 +103,11 @@ class RuntimeConnectionResolver:
             else ConnectorFactory(create_connector_registry())
         )
 
-    def resolve(self, connection_id: int) -> BaseConnector:
+    def resolve(
+        self,
+        connection_id: int,
+        database_name_override: str | None = None,
+    ) -> BaseConnector:
         """
         Resolve a connection ID into a connector instance.
 
@@ -151,6 +157,15 @@ class RuntimeConnectionResolver:
         # The factory uses metadata.connector_code to select the correct
         # implementation from the connector registry.
         connector = self._connector_factory.create(metadata)
+
+        if database_name_override is not None:
+            database_name = database_name_override.strip()
+            if not database_name:
+                raise ValueError("database_name_override must not be empty.")
+            connector.metadata = replace(
+                metadata,
+                database_name=database_name,
+            )
 
         # Return the connector without opening a physical database
         # connection yet.

@@ -392,6 +392,72 @@ def main() -> None:
             "Target Row Count Verification : PASSED"
         )
 
+        target_columns = [
+            mapping.target_field_name
+            for mapping in sorted(
+                field_mappings,
+                key=lambda mapping_item: mapping_item.ordinal_no,
+            )
+        ]
+        quoted_columns = ", ".join(
+            FullLoadExecutor._quote_identifier(column)
+            for column in target_columns
+        )
+        quoted_target = (
+            f"{FullLoadExecutor._quote_identifier(target_schema)}."
+            f"{FullLoadExecutor._quote_identifier(target_table)}"
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {quoted_columns} "
+                f"FROM {quoted_target} "
+                "LIMIT 10;"
+            )
+            preview_rows = cursor.fetchall()
+
+        preview_values = [
+            ["NULL" if value is None else str(value) for value in row]
+            for row in preview_rows
+        ]
+        column_widths = [
+            min(
+                max(
+                    len(column),
+                    max(
+                        (len(row[index]) for row in preview_values),
+                        default=0,
+                    ),
+                ),
+                40,
+            )
+            for index, column in enumerate(target_columns)
+        ]
+
+        def format_cell(value: str, width: int) -> str:
+            if len(value) > width:
+                value = value[: width - 3] + "..."
+            return value.ljust(width)
+
+        print()
+        print("Target Table Preview (first 10 rows)")
+        print(
+            " | ".join(
+                format_cell(column, column_widths[index])
+                for index, column in enumerate(target_columns)
+            )
+        )
+        print(
+            "-+-".join("-" * width for width in column_widths)
+        )
+        for row in preview_values:
+            print(
+                " | ".join(
+                    format_cell(value, column_widths[index])
+                    for index, value in enumerate(row)
+                )
+            )
+
     finally:
         # Always close the verification connector.
         verification_connector.close()

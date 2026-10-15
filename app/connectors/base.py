@@ -34,6 +34,7 @@ Architecture:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, Iterator
 
 from app.models.connection import ConnectionMetadata
@@ -183,6 +184,7 @@ class BaseConnector(ABC):
         self,
         query: str,
         batch_size: int,
+        parameters: Sequence[Any] | None = None,
     ) -> Iterator[list[tuple[Any, ...]]]:
         """
         Read source data in controlled batches.
@@ -230,6 +232,8 @@ class BaseConnector(ABC):
         target_table: str,
         column_names: list[str],
         rows: list[tuple[Any, ...]],
+        duplicate_strategy: str = "ALLOW",
+        primary_key_columns: list[str] | None = None,
     ) -> int:
         """
         Write one batch of records into the target table.
