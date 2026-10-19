@@ -87,3 +87,9 @@ You can also specify exact table names on the command line:
 Only the selected source tables are passed to the incremental append workflow.
 The same watermark, target-table setup, and append behavior as the multi-table
 demo is used for each selected table.
+
+Source discovery and target-resolution failures are reported and stop the run.
+If an individual selected table fails, the runner reports its name and error,
+continues with the remaining selections, then returns a failure status after
+showing the successful table count and failed table names. Invalid menu
+selections are reprompted; end-of-input or Ctrl+C cancels before loading.

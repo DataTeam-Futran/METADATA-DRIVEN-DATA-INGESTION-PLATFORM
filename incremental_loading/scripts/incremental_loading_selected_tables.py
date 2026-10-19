@@ -83,9 +83,13 @@ def print_table_choices(source_tables: Sequence[str]) -> None:
 def prompt_for_tables(source_tables: Sequence[str]) -> list[str]:
     """Prompt until valid menu choices are provided, or the user cancels."""
     while True:
-        selection = input(
-            "Select table number(s) separated by commas, or q to cancel: "
-        ).strip()
+        try:
+            selection = input(
+                "Select table number(s) separated by commas, or q to cancel: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSelection cancelled; no tables were loaded.")
+            return []
         if selection.lower() == "q":
             return []
         try:
@@ -115,13 +119,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     resolver = RuntimeConnectionResolver()
-    source_connector = resolver.resolve(multi_table_loader.SOURCE_CONNECTION_ID)
-    source_connector.connect()
     try:
-        source_tables = source_connector.list_tables(multi_table_loader.SOURCE_SCHEMA)
+        source_connector = resolver.resolve(multi_table_loader.SOURCE_CONNECTION_ID)
+        source_connector.connect()
+        try:
+            source_tables = source_connector.list_tables(
+                multi_table_loader.SOURCE_SCHEMA
+            )
+        finally:
+            source_connector.close()
         source_database = source_connector.metadata.database_name
-    finally:
-        source_connector.close()
+    except Exception as error:
+        print(f"Unable to connect to or discover source tables: {error}")
+        return 1
 
     if not source_tables:
         print(
@@ -145,10 +155,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Selection cancelled; no tables were loaded.")
             return 0
 
-    target_connector = resolver.resolve(
-        multi_table_loader.TARGET_CONNECTION_ID,
-        database_name_override=multi_table_loader.TARGET_DATABASE,
-    )
+    try:
+        target_connector = resolver.resolve(
+            multi_table_loader.TARGET_CONNECTION_ID,
+            database_name_override=multi_table_loader.TARGET_DATABASE,
+        )
+    except Exception as error:
+        print(f"Unable to resolve target connection: {error}")
+        return 1
     print("=" * 72)
     print("SELECTED-TABLE INCREMENTAL APPEND")
     print(
@@ -192,6 +206,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ],
     )
     if failures:
+        multi_table_loader.print_details_section(
+            "TABLE LOAD FAILURES",
+            [
+                ("Tables failed", len(failures)),
+                ("Failed table names", ", ".join(table for table, _ in failures)),
+            ],
+        )
         print(
             "One or more selected tables failed: "
             + "; ".join(f"{table}: {error}" for table, error in failures)
