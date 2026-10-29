@@ -26,7 +26,7 @@ Flow:
             ↓
     Schema Discovery
 """
-
+import argparse
 from app.connectors.factory import ConnectorFactory
 from app.connectors.register_connectors import (
     create_connector_registry,
@@ -50,7 +50,18 @@ def main() -> None:
     # used later by CredentialResolver.
     # =========================================================
 
-    connection_id = 1
+    parser = argparse.ArgumentParser(
+    description="Test a source database connection dynamically."
+    )
+    parser.add_argument(
+        "--connection-id",
+        type=int,
+        default=1,
+        help="Metadata connection ID to test (default: 1).",
+    )
+    args = parser.parse_args()
+
+    connection_id = args.connection_id
 
     connection_service = ConnectionService()
 

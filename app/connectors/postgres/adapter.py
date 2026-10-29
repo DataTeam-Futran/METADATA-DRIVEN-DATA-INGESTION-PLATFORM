@@ -476,7 +476,7 @@ class PostgreSQLConnector(BaseConnector):
             # Apply PostgreSQL statement_timeout using the platform
             # command timeout metadata.
             self._set_command_timeout()
-
+  
             # -------------------------------------------------
             # Return active connection.
             # -------------------------------------------------
@@ -845,7 +845,13 @@ class PostgreSQLConnector(BaseConnector):
                 data_type,
                 ordinal_position,
                 is_nullable,
-                column_default
+                column_default,
+                character_maximum_length,
+                numeric_precision,
+                numeric_scale,
+                datetime_precision,
+                is_identity,
+                is_generated
             FROM information_schema.columns
             WHERE table_schema = %s
               AND table_name = %s
@@ -874,6 +880,12 @@ class PostgreSQLConnector(BaseConnector):
                 "ordinal_position": row[2],
                 "is_nullable": row[3],
                 "column_default": row[4],
+                "character_maximum_length": row[5],
+                "numeric_precision": row[6],
+                "numeric_scale": row[7],
+                "datetime_precision": row[8],
+                "is_identity": row[9],
+                "is_generated": row[10],
             }
             for row in rows
         ]
@@ -1235,6 +1247,306 @@ class PostgreSQLConnector(BaseConnector):
     # =========================================================
     # TARGET TABLE PREPARATION
     # =========================================================
+    
+    
+    def schema_exists(self, schema_name: str) -> bool:
+        if not schema_name or not schema_name.strip():
+            raise ValueError("schema_name must not be empty.")
+
+        query = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.schemata
+                WHERE schema_name = %s
+            );
+        """
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(query, (schema_name.strip(),))
+            row = cursor.fetchone()
+        return bool(row[0])
+
+    def table_exists(
+        self,
+        schema_name: str,
+        table_name: str,
+    ) -> bool:
+        if not schema_name or not schema_name.strip():
+            raise ValueError("schema_name must not be empty.")
+        if not table_name or not table_name.strip():
+            raise ValueError("table_name must not be empty.")
+
+        query = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                  AND table_name = %s
+                  AND table_type = 'BASE TABLE'
+            );
+        """
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(
+                query,
+                (schema_name.strip(), table_name.strip()),
+            )
+            row = cursor.fetchone()
+        return bool(row[0])
+
+    def create_schema(self, schema_name: str) -> None:
+        quoted_schema = self._quote_identifier(schema_name)
+        query = f"CREATE SCHEMA IF NOT EXISTS {quoted_schema};"
+
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(query)
+
+    @staticmethod
+    def _target_column_type(
+        data_type: str,
+        column_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Map supported source types to safe PostgreSQL types."""
+        normalized = data_type.strip().lower()
+        metadata = column_metadata or {}
+
+        def positive_integer(attribute: str) -> int | None:
+            value = metadata.get(attribute)
+            if isinstance(value, int) and value > 0:
+                return value
+            return None
+
+        character_length = positive_integer("character_maximum_length")
+        numeric_precision = positive_integer("numeric_precision")
+        numeric_scale = metadata.get("numeric_scale")
+        datetime_precision = metadata.get("datetime_precision")
+
+        type_map = {
+            "text": "TEXT",
+            "character varying": (
+                f"VARCHAR({character_length})"
+                if character_length
+                else "VARCHAR"
+            ),
+            "varchar": (
+                f"VARCHAR({character_length})"
+                if character_length
+                else "VARCHAR"
+            ),
+            "character": (
+                f"CHAR({character_length})" if character_length else "CHAR"
+            ),
+            "char": f"CHAR({character_length})" if character_length else "CHAR",
+            "integer": "INTEGER",
+            "int": "INTEGER",
+            "int2": "SMALLINT",
+            "smallint": "SMALLINT",
+            "int4": "INTEGER",
+            "int8": "BIGINT",
+            "bigint": "BIGINT",
+            "numeric": "NUMERIC",
+            "decimal": "NUMERIC",
+            "real": "REAL",
+            "double precision": "DOUBLE PRECISION",
+            "float": "DOUBLE PRECISION",
+            "boolean": "BOOLEAN",
+            "bool": "BOOLEAN",
+            "date": "DATE",
+            "timestamp without time zone": "TIMESTAMP",
+            "timestamp with time zone": "TIMESTAMPTZ",
+            "datetime": "TIMESTAMP",
+            "time without time zone": "TIME",
+            "time with time zone": "TIMETZ",
+            "bytea": "BYTEA",
+            "binary": "BYTEA",
+            "uuid": "UUID",
+        }
+
+        if normalized not in type_map:
+            raise ValueError(
+                f"Unsupported source data type for PostgreSQL target: "
+                f"{data_type!r}"
+            )
+
+        if normalized in {"numeric", "decimal"} and numeric_precision:
+            if (
+                isinstance(numeric_scale, int)
+                and 0 <= numeric_scale <= numeric_precision
+            ):
+                return f"NUMERIC({numeric_precision}, {numeric_scale})"
+            if numeric_scale is None:
+                return f"NUMERIC({numeric_precision})"
+            raise ValueError(
+                "Unsupported numeric precision/scale metadata: "
+                f"precision={numeric_precision}, scale={numeric_scale}."
+            )
+
+        if normalized in {
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "time with time zone",
+        } and isinstance(datetime_precision, int):
+            if 0 <= datetime_precision <= 6:
+                base_type = type_map[normalized]
+                return f"{base_type}({datetime_precision})"
+            raise ValueError(
+                "PostgreSQL temporal precision must be between 0 and 6."
+            )
+
+        return type_map[normalized]
+
+    def create_table(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: list[dict[str, Any]],
+    ) -> None:
+        if not schema_name or not schema_name.strip():
+            raise ValueError("schema_name must not be empty.")
+        if not table_name or not table_name.strip():
+            raise ValueError("table_name must not be empty.")
+        if not columns:
+            raise ValueError("columns must contain at least one column.")
+
+        if not self.schema_exists(schema_name):
+            raise LookupError(
+                f"Target schema does not exist: {schema_name}"
+            )
+
+        if self.table_exists(schema_name, table_name):
+            return
+
+        ordered_columns = sorted(
+            columns,
+            key=lambda col: col.get(
+                "ordinal_position",
+                col.get("ordinal_no", 0),
+            ),
+        )
+
+        definitions = []
+
+        for column in ordered_columns:
+            column_name = column.get("column_name")
+            data_type = column.get("data_type")
+
+            if not isinstance(column_name, str) or not column_name.strip():
+                raise ValueError("Every column needs a valid column_name.")
+            if not isinstance(data_type, str) or not data_type.strip():
+                raise ValueError(
+                    f"Missing data_type for column {column_name!r}."
+                )
+
+            quoted_column = self._quote_identifier(column_name)
+            target_type = self._target_column_type(data_type, column)
+
+            nullable = column.get("is_nullable", True)
+            if isinstance(nullable, str):
+                nullable = nullable.strip().upper() in ("YES", "TRUE", "Y")
+
+            null_clause = "" if nullable else " NOT NULL"
+
+            definitions.append(
+                f"{quoted_column} {target_type}{null_clause}"
+            )
+
+        quoted_table = (
+            f"{self._quote_identifier(schema_name)}."
+            f"{self._quote_identifier(table_name)}"
+        )
+
+        query = (
+            f"CREATE TABLE {quoted_table} "
+            f"({', '.join(definitions)});"
+        )
+
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(query)
+
+    def add_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        column: dict[str, Any],
+    ) -> None:
+        column_name = column.get("column_name")
+        data_type = column.get("data_type")
+        if not isinstance(column_name, str) or not column_name.strip():
+            raise ValueError("Every column needs a valid column_name.")
+        if not isinstance(data_type, str) or not data_type.strip():
+            raise ValueError(
+                f"Missing data_type for column {column_name!r}."
+            )
+
+        nullable = column.get("is_nullable", True)
+        if isinstance(nullable, str):
+            nullable = nullable.strip().upper() in ("YES", "TRUE", "Y")
+
+        quoted_table = (
+            f"{self._quote_identifier(schema_name)}."
+            f"{self._quote_identifier(table_name)}"
+        )
+        query = (
+            f"ALTER TABLE {quoted_table} ADD COLUMN "
+            f"{self._quote_identifier(column_name)} "
+            f"{self._target_column_type(data_type, column)}"
+            f"{'' if nullable else ' NOT NULL'};"
+        )
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(query)
+
+    def drop_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_name: str,
+    ) -> None:
+        if not column_name or not column_name.strip():
+            raise ValueError("column_name must not be empty.")
+        quoted_table = (
+            f"{self._quote_identifier(schema_name)}."
+            f"{self._quote_identifier(table_name)}"
+        )
+        query = (
+            f"ALTER TABLE {quoted_table} DROP COLUMN "
+            f"{self._quote_identifier(column_name)};"
+        )
+        with self._require_connection().cursor() as cursor:
+            cursor.execute(query)
+
+    def count_rows(
+        self,
+        schema_name: str,
+        table_name: str,
+    ) -> int:
+        """Return the row count for a PostgreSQL table."""
+
+        if not schema_name or not schema_name.strip():
+            raise ValueError("schema_name must not be empty.")
+
+        if not table_name or not table_name.strip():
+            raise ValueError("table_name must not be empty.")
+
+        qualified_table = (
+            f"{self._quote_identifier(schema_name)}."
+            f"{self._quote_identifier(table_name)}"
+        )
+
+        query = f"SELECT COUNT(*) FROM {qualified_table};"
+
+        connection = self._require_connection()
+
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            row = cursor.fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                f"Row count query returned no result for "
+                f"{schema_name}.{table_name}."
+            )
+
+        return int(row[0])
+
 
     def truncate_table(
         self,

@@ -53,6 +53,7 @@ class CredentialResolver:
 
         self._providers: dict[str, SecretProvider] = {
             "DEMO": DemoSecretProvider(),
+             "ENV": DemoSecretProvider(),
         }
 
     def resolve(self, credential_id: int) -> str:

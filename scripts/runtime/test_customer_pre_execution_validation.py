@@ -35,6 +35,7 @@ from app.runtime.context_resolver import RuntimeExecutionContextResolver
 # Import the pre-execution validator.
 from app.runtime.pre_execution_validator import PreExecutionValidator
 
+from app.runtime.field_mapping_resolver import RuntimeFieldMappingResolver
 
 def main() -> None:
     """
@@ -111,9 +112,19 @@ def main() -> None:
     # ----------------------------------------------------------------------
     # The validator opens the physical connections only for read-only
     # validation and closes them afterward.
+    field_mapping_resolver = RuntimeFieldMappingResolver()
+
+    field_mappings = field_mapping_resolver.resolve(
+    mapping_version_id=context.execution_plan.mapping.mapping_version_id,
+    tenant_id=tenant_id,
+)
+
     validator = PreExecutionValidator()
 
-    validation_results = validator.validate(context)
+    validation_results = validator.validate(
+    context,
+    field_mappings=field_mappings,
+)
 
     # ----------------------------------------------------------------------
     # STEP 3 - DISPLAY VALIDATION RESULTS

@@ -1,155 +1,95 @@
-"""
-Customer Target Write Test
-===========================
 
-Purpose
--------
-Test the PostgreSQL connector's write_batch() method.
+"""Metadata-driven target batch-write rollback integration test."""
 
-This test inserts two temporary records into:
-
-    ingestion_metastore.warehouse.customer_target
-
-and then rolls the transaction back.
-
-WHY?
-----
-We want to prove that the connector can write data before
-building the complete Full Load execution engine.
-
-The test must NOT permanently modify the target table.
-"""
-
-from app.runtime.connection_resolver import RuntimeConnectionResolver
+from target_write_test_helpers import (
+    build_test_rows,
+    inspect_writable_columns,
+    resolve_target,
+    verify_marker_count,
+)
 
 
-def main() -> None:
-    """
-    Test PostgreSQL target batch writing.
-    """
-
+def main():
     print("=" * 70)
-    print("CUSTOMER TARGET WRITE TEST")
+    print("METADATA-DRIVEN TARGET WRITE TEST")
     print("=" * 70)
 
-    # ---------------------------------------------------------
-    # Resolve target connector
-    # ---------------------------------------------------------
-
-    # Connection ID 11 is the metadata-defined target connection.
-    connection_resolver = RuntimeConnectionResolver()
-
-    target_connector = connection_resolver.resolve(
-        connection_id=11,
-    )
-
-    print()
-    print(
-        f"Target Connector : "
-        f"{type(target_connector).__name__}"
-    )
+    connector, target_object = resolve_target()
+    connection = None
+    rollback_verified = False
 
     try:
-        # -----------------------------------------------------
-        # Open target connection
-        # -----------------------------------------------------
+        connection = connector.connect()
 
-        # The connector resolves the credential internally and
-        # establishes the physical PostgreSQL connection.
-        connection = target_connector.connect()
+        print(f"Target connector : {type(connector).__name__}")
+        print(
+            f"Target object    : {target_object.catalog_name}."
+            f"{target_object.schema_name}.{target_object.object_name}"
+        )
 
-        print("Target Connection : OPEN")
+        columns, marker_column = inspect_writable_columns(
+            connection, target_object
+        )
+        column_names = [column["name"] for column in columns]
 
-        # -----------------------------------------------------
-        # Prepare temporary test rows
-        # -----------------------------------------------------
+        marker_values, test_rows = build_test_rows(
+            connection, target_object, columns, marker_column
+        )
 
-        # These are artificial test records.
-        #
-        # They are NOT source customer records.
-        #
-        # We will roll them back after the INSERT test.
-        test_rows = [
-            (
-                900001,
-                "MDIP Connector Test 1",
-                "mdip-test-1@example.com",
-                "Test City",
-            ),
-            (
-                900002,
-                "MDIP Connector Test 2",
-                "mdip-test-2@example.com",
-                "Test City",
-            ),
-        ]
+        print(f"Discovered columns: {column_names}")
 
-        # Target columns are explicitly specified so that
-        # values are inserted into the correct columns.
-        target_columns = [
-            "customer_id",
-            "customer_name",
-            "email",
-            "city",
-        ]
-
-        # -----------------------------------------------------
-        # Write test batch
-        # -----------------------------------------------------
-
-        # write_batch() performs the INSERT but intentionally
-        # does not commit the transaction.
-        rows_written = target_connector.write_batch(
-            target_schema="warehouse",
-            target_table="customer_target",
-            column_names=target_columns,
+        rows_written = connector.write_batch(
+            target_schema=target_object.schema_name,
+            target_table=target_object.object_name,
+            column_names=column_names,
             rows=test_rows,
         )
 
-        print(
-            f"Rows Written : {rows_written}"
-        )
-
-        # -----------------------------------------------------
-        # Validate expected row count
-        # -----------------------------------------------------
-
         if rows_written != len(test_rows):
             raise RuntimeError(
-                "Unexpected number of rows reported "
-                "by write_batch()."
+                f"Expected {len(test_rows)} inserted rows; "
+                f"connector reported {rows_written}."
             )
 
-        print("Batch Write : PASSED")
+        visible_before_rollback = verify_marker_count(
+            connection, target_object, marker_column, marker_values
+        )
+        if visible_before_rollback != len(test_rows):
+            raise RuntimeError(
+                "Inserted test rows could not be verified inside "
+                "the transaction."
+            )
 
-        # -----------------------------------------------------
-        # Roll back test transaction
-        # -----------------------------------------------------
+        print("Batch write verification: PASSED")
 
-        # The write_batch() method intentionally does not commit.
-        #
-        # Therefore the temporary records can be removed by
-        # rolling back the current target transaction.
-        connection.rollback()
+        connector.rollback()
+        rollback_verified = True
 
-        print("Transaction Rollback : PASSED")
-        print("Test Data Persisted : NO")
+        visible_after_rollback = verify_marker_count(
+            connection, target_object, marker_column, marker_values
+        )
+        if visible_after_rollback != 0:
+            raise RuntimeError(
+                "Temporary test records remain visible after rollback."
+            )
+
+        print("Rollback verification  : PASSED")
+        print("Test rows persisted    : NO")
+
 
     finally:
-        # -----------------------------------------------------
-        # Close target connection
-        # -----------------------------------------------------
+        try:
+            if connection is not None and not rollback_verified:
+                try:
+                    connector.rollback()
+                    print("Cleanup rollback       : COMPLETED")
+                except Exception as exc:
+                    print(f"CRITICAL: rollback failed: {exc}")
+                    raise
+        finally:
+            connector.close()
+            print("Target connection      : CLOSED")
 
-        # Always release the physical database connection,
-        # including when the test fails.
-        target_connector.close()
-
-        print("Target Connection : CLOSED")
-
-    print()
-    print("=" * 70)
-    print("CUSTOMER TARGET WRITE TEST PASSED")
-    print("=" * 70)
 
 
 if __name__ == "__main__":

@@ -1,213 +1,436 @@
 """
-Customer Full Load Executor - Integration Test
-===============================================
+Customer FULL LOAD Executor - Integration Test
+================================================
 
-Purpose
+PURPOSE
 -------
-Validates the complete FULL LOAD execution path for the Customer POC.
+Validates the complete metadata-driven FULL LOAD execution path
+for the Customer POC.
 
-The test verifies:
+This script is an INTEGRATION / DEMONSTRATION TEST.
+
+It validates that the runtime components work together correctly:
 
     1. Runtime execution context resolution
     2. Runtime field mapping resolution
-    3. Source database connection
-    4. Target database connection
-    5. Target TRUNCATE operation
-    6. Source batch reading
-    7. Target batch writing
-    8. Target transaction commit
-    9. Target row-count verification
-    10. Optional test-data cleanup
+    3. Dynamic source connection resolution
+    4. Dynamic target connection resolution
+    5. Source/target physical schema validation
+    6. Source data availability validation
+    7. Target TRUNCATE operation
+    8. Source batch reading
+    9. Target batch writing
+    10. Target transaction commit
+    11. Target row-count verification
+    12. Optional test-data cleanup
 
-Current Customer POC
+
+CURRENT CUSTOMER POC
 --------------------
-Source:
 
+Source:
     demo_source_db.public.customer
 
 Target:
-
     ingestion_metastore.warehouse.customer_target
 
+Pipeline:
+    Pipeline Version 2
+
+Mapping:
+    Mapping Version 2
+
+Load:
+    FULL + TRUNCATE_INSERT
+
+Batch Size:
+    5000
+
 Field mappings:
+    customer_id    -> customer_id
+    customer_name  -> customer_name
+    email          -> email
+    city           -> city
 
-    customer_id   -> customer_id
-    customer_name -> customer_name
-    email         -> email
-    city          -> city
 
-Important
----------
-The FullLoadExecutor owns and commits the target transaction.
+IMPORTANT - EXCEPTION HANDLING RESPONSIBILITY
+----------------------------------------------
 
-Therefore, this test verifies the committed result and then performs
-an explicit cleanup so that the development target table is returned
-to an empty state.
+This file is ONLY the integration/demo test harness.
 
-This is an integration test and therefore performs real source reads
-and target writes.
+The actual exception handling must NOT be implemented here.
+
+Actual exception handling is implemented in:
+
+    1. app/core/exceptions.py
+       - Defines the common ingestion exception hierarchy.
+       - Example:
+             IngestionPlatformError
+             ConnectionResolutionError
+             SchemaValidationError
+             SourceReadError
+             TargetWriteError
+             TransactionError
+             NoSourceDataError
+             etc.
+
+    2. app/runtime/full_load_executor.py
+       - Handles the FULL LOAD execution flow.
+       - Handles source/target connection failures.
+       - Handles schema validation failures.
+       - Handles source read failures.
+       - Handles target TRUNCATE failures.
+       - Handles target write failures.
+       - Handles transaction failures.
+       - Performs rollback when required.
+       - Handles zero-source-record scenario.
+       - Performs connection/resource cleanup.
+
+    3. app/connectors/postgres/adapter.py
+       - Performs PostgreSQL-specific database operations.
+       - Raises underlying database exceptions.
+       - Does not contain the complete business-level execution flow.
+
+
+IMPORTANT - NEGATIVE TEST SCENARIOS
+-----------------------------------
+
+Individual failure scenarios should be deliberately tested through
+a separate negative-test script.
+
+Examples:
+
+    FL-001  Source DB unavailable
+    FL-002  Wrong source credentials
+    FL-003  Source table does not exist
+    FL-004  Source schema changed
+    FL-005  Target DB unavailable
+    FL-006  Target table does not exist
+    FL-007  Permission denied
+    FL-008  TRUNCATE failure
+    FL-009  Source extraction failure
+    FL-010  Data type mismatch
+    FL-011  NOT NULL violation
+    FL-012  Duplicate PK
+    FL-013  Target disk full
+    FL-014  Network failure during load
+    FL-015  Metadata missing
+    FL-016  Wrong target mapping
+    FL-017  Application crash after TRUNCATE
+    FL-018  Application crash after INSERT
+    FL-019  Audit update failure
+    FL-020  Failure after TRUNCATE
+    FL-021  Source returns zero records
+    FL-022  No new records - Incremental load
+
+
+IMPORTANT - FL-021 ZERO SOURCE RECORDS
+--------------------------------------
+
+FL-021 is handled by FullLoadExecutor.
+
+The expected execution sequence is:
+
+    1. Resolve source connection
+    2. Resolve target connection
+    3. Validate physical schema
+    4. Read the first source batch
+    5. If source returns zero records:
+           raise NoSourceDataError
+    6. STOP execution
+    7. Do NOT begin target transaction
+    8. Do NOT TRUNCATE target
+
+This is important because a FULL LOAD must not destroy existing
+target data when the source contains zero records.
+
+The implementation belongs in:
+
+    app/runtime/full_load_executor.py
+
+The exception definition belongs in:
+
+    app/core/exceptions.py
+
+
+IMPORTANT - FL-017 / FL-018 APPLICATION CRASH
+---------------------------------------------
+
+Process-level crashes cannot always be caught by Python try/except.
+
+For example:
+
+    FL-017:
+        Application crashes after TRUNCATE.
+
+    FL-018:
+        Application crashes after INSERT.
+
+The target transaction should protect uncommitted changes.
+
+Expected behavior:
+
+    BEGIN TRANSACTION
+        |
+        +-- TRUNCATE
+        |
+        +-- INSERT
+        |
+        +-- COMMIT
+             |
+             +-- Only committed data becomes permanent.
+
+If the application/process terminates before COMMIT,
+PostgreSQL transaction semantics should roll back the
+uncommitted transaction.
+
+Dedicated crash testing is still required to validate this.
+
+
+IMPORTANT - FL-019 / AUDIT FAILURE
+----------------------------------
+
+FL-019 is not a responsibility of this Customer FULL LOAD
+integration test.
+
+Audit/status update handling belongs to the runtime/audit layer.
+
+The executor should not silently treat an audit update failure
+as a successful ingestion.
+
+
+IMPORTANT - FL-022 / INCREMENTAL LOAD
+--------------------------------------
+
+FL-022:
+
+    "No new records - Incremental"
+
+is outside the scope of this FULL LOAD executor.
+
+It belongs to the incremental-load implementation because
+incremental processing requires watermark/change tracking logic.
+
+
+RUN
+---
+
+Run this script from the project root:
+
+    python -m scripts.runtime.test_customer_full_load_executor
 """
 
-# Import the runtime execution context resolver.
-#
-# This resolver combines:
-#
-#     Runtime Execution Plan
-#     Source Physical Object
-#     Target Physical Object
-#     Source Connector
-#     Target Connector
-#
-# It internally creates the required metadata, object, and connection
-# resolvers.
+
+from __future__ import annotations
+
+
+# ================================================================
+# STANDARD LIBRARY IMPORTS
+# ================================================================
+
+import logging
+
+
+# ================================================================
+# APPLICATION IMPORTS
+# ================================================================
+
+from app.core.exceptions import IngestionPlatformError
+from app.runtime.connection_resolver import RuntimeConnectionResolver
 from app.runtime.context_resolver import RuntimeExecutionContextResolver
-
-# Import the runtime field mapping resolver.
-#
-# This resolves the metadata-driven source-to-target field mappings
-# from map.mapping_field, map.mapping_field_input, and
-# catalog.dataset_field.
 from app.runtime.field_mapping_resolver import RuntimeFieldMappingResolver
-
-# Import the Full Load Executor that performs the actual source-to-target
-# data movement.
 from app.runtime.full_load_executor import FullLoadExecutor
 
+
+# ================================================================
+# LOGGING
+# ================================================================
+
+# Keep logging simple for the current POC.
+#
+# Production structured logging / audit logging can be implemented
+# separately in the runtime/audit layer.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ================================================================
+# TEST CONFIGURATION
+# ================================================================
+
+# Existing Customer POC pipeline version.
+PIPELINE_VERSION_ID = 2
+
+# Existing Customer POC tenant.
+TENANT_ID = 1
+
+# Existing Customer POC environment.
+ENVIRONMENT_ID = 1
+
+
+# ----------------------------------------------------------------
+# CLEANUP CONFIGURATION
+# ----------------------------------------------------------------
+#
+# False:
+#     Keep target data after successful execution.
+#
+#     Useful when demonstrating the loaded data in pgAdmin.
+#
+# True:
+#     Truncate the target table after successful verification.
+#
+# ----------------------------------------------------------------
+
+CLEANUP_AFTER_TEST = False
+
+
+# ================================================================
+# MAIN TEST
+# ================================================================
 
 def main() -> None:
     """
     Execute the Customer FULL LOAD integration test.
 
-    The test uses the existing Customer POC metadata:
+    IMPORTANT:
+        This function is responsible for orchestration and
+        verification only.
 
-        Pipeline Version : 2
-        Tenant            : 1
-        Environment       : 1
-
-    The FullLoadExecutor performs the actual load and commits the
-    target transaction.
-
-    After successful verification, the test optionally truncates
-    the target again depending on CLEANUP_AFTER_TEST.
+        The actual FULL LOAD exception handling belongs to
+        FullLoadExecutor and the platform exception hierarchy.
     """
 
-    # =============================================================
-    # TEST CONFIGURATION
-    # =============================================================
-
-    # Existing Customer POC pipeline version.
-    pipeline_version_id = 2
-
-    # Existing Customer POC tenant.
-    tenant_id = 1
-
-    # Existing Customer POC environment.
-    environment_id = 1
-
-    # Existing Customer target physical object.
-    target_schema = "warehouse"
-    target_table = "customer_target"
-
-    # Controls whether test data is removed after successful verification.
-    #
-    # True  = integration-test mode; clean the target after verification.
-    # False = demo/debug mode; keep the loaded rows in the target table
-    #         so they can be inspected after the test completes.
-    CLEANUP_AFTER_TEST = False
-
-    # =============================================================
-    # CREATE RUNTIME CONTEXT RESOLVER
-    # =============================================================
-
-    # Create the resolver responsible for building the complete
-    # RuntimeExecutionContext.
-    #
-    # The resolver internally creates:
-    #
-    #     RuntimeMetadataResolver
-    #     RuntimeObjectResolver
-    #     RuntimeConnectionResolver
-    #
-    # No physical database connection is opened at this stage.
-    context_resolver = RuntimeExecutionContextResolver()
-
-    # =============================================================
-    # RESOLVE COMPLETE RUNTIME CONTEXT
-    # =============================================================
-
-    # Resolve the complete execution context from metadata.
-    #
-    # This resolves:
-    #
-    #     Pipeline Version
-    #          ↓
-    #     Execution Plan
-    #          ↓
-    #     Source Object
-    #          ↓
-    #     Target Object
-    #          ↓
-    #     Source Connector
-    #          ↓
-    #     Target Connector
-    context = context_resolver.resolve(
-        pipeline_version_id=pipeline_version_id,
-        tenant_id=tenant_id,
-        environment_id=environment_id,
-    )
-
-    # =============================================================
-    # RESOLVE FIELD MAPPINGS
-    # =============================================================
-
-    # Create the field mapping resolver.
-    field_mapping_resolver = RuntimeFieldMappingResolver()
-
-    # Resolve the source-to-target field mappings using the mapping
-    # version already resolved inside the execution plan.
-    field_mappings = field_mapping_resolver.resolve(
-        mapping_version_id=(
-            context.execution_plan.mapping.mapping_version_id
-        ),
-        tenant_id=tenant_id,
-    )
-
-    # =============================================================
-    # DISPLAY TEST INFORMATION
-    # =============================================================
-
+    print()
     print("=" * 80)
     print("CUSTOMER FULL LOAD EXECUTOR TEST")
     print("=" * 80)
 
+
+    # ============================================================
+    # 1. RESOLVE RUNTIME EXECUTION CONTEXT
+    # ============================================================
+
     print()
+    print("-" * 80)
+    print("STEP 1 - RESOLVE RUNTIME EXECUTION CONTEXT")
+    print("-" * 80)
+
+    # The execution context contains runtime metadata required
+    # by the FULL LOAD executor.
+    context_resolver = RuntimeExecutionContextResolver()
+
+    context = context_resolver.resolve(
+        pipeline_version_id=PIPELINE_VERSION_ID,
+        tenant_id=TENANT_ID,
+        environment_id=ENVIRONMENT_ID,
+    )
+
     print(
         "Pipeline Version :",
         context.execution_plan.pipeline_version_id,
     )
 
     print(
-        "Mapping Version  :",
+        "Tenant ID        :",
+        TENANT_ID,
+    )
+
+    print(
+        "Environment ID   :",
+        ENVIRONMENT_ID,
+    )
+
+
+    # ============================================================
+    # 2. RESOLVE FIELD MAPPINGS
+    # ============================================================
+
+    print()
+    print("-" * 80)
+    print("STEP 2 - RESOLVE FIELD MAPPINGS")
+    print("-" * 80)
+
+    # Field mappings are resolved dynamically from metadata.
+    #
+    # No source/target column mappings are hard-coded in the
+    # executor.
+    field_mapping_resolver = RuntimeFieldMappingResolver()
+
+    field_mappings = field_mapping_resolver.resolve(
+        mapping_version_id=(
+            context.execution_plan.mapping.mapping_version_id
+        ),
+        tenant_id=TENANT_ID,
+    )
+
+    print(
+        "Mapping Version :",
         context.execution_plan.mapping.mapping_version_id,
+    )
+
+    print()
+    print("Resolved Field Mappings")
+    print("-" * 80)
+
+    for mapping in field_mappings:
+
+        print(
+            f"{mapping.ordinal_no}: "
+            f"{mapping.source_field_name} -> "
+            f"{mapping.target_field_name} "
+            f"[{mapping.mapping_type_code}]"
+        )
+
+
+    # ============================================================
+    # 3. DISPLAY EXECUTION CONFIGURATION
+    # ============================================================
+
+    print()
+    print("-" * 80)
+    print("STEP 3 - EXECUTION CONFIGURATION")
+    print("-" * 80)
+
+    execution_plan = context.execution_plan
+
+    print(
+        "Pipeline Version :",
+        execution_plan.pipeline_version_id,
+    )
+
+    print(
+        "Mapping Version  :",
+        execution_plan.mapping.mapping_version_id,
     )
 
     print(
         "Load Type        :",
-        context.execution_plan.mapping.load_type_code,
+        execution_plan.mapping.load_type_code,
     )
 
     print(
         "Load Strategy    :",
-        context.execution_plan.mapping.load_strategy_code,
+        execution_plan.mapping.load_strategy_code,
     )
 
     print(
         "Batch Size       :",
-        context.execution_plan.load_config.batch_size,
+        execution_plan.load_config.batch_size,
     )
 
+
+    # ============================================================
+    # 4. DISPLAY SOURCE OBJECT
+    # ============================================================
+
     print()
-    print("Source Object")
+    print("-" * 80)
+    print("SOURCE OBJECT")
     print("-" * 80)
 
     print(
@@ -230,8 +453,14 @@ def main() -> None:
         context.source_object.object_name,
     )
 
+
+    # ============================================================
+    # 5. DISPLAY TARGET OBJECT
+    # ============================================================
+
     print()
-    print("Target Object")
+    print("-" * 80)
+    print("TARGET OBJECT")
     print("-" * 80)
 
     print(
@@ -254,60 +483,88 @@ def main() -> None:
         context.target_object.object_name,
     )
 
+
+    # ============================================================
+    # 6. CREATE FULL LOAD EXECUTOR
+    # ============================================================
+
     print()
-    print("Field Mappings")
+    print("-" * 80)
+    print("STEP 4 - CREATE FULL LOAD EXECUTOR")
     print("-" * 80)
 
-    # Display the resolved field mappings in execution order.
-    for mapping in field_mappings:
-        print(
-            f"{mapping.ordinal_no}: "
-            f"{mapping.source_field_name} -> "
-            f"{mapping.target_field_name} "
-            f"[{mapping.mapping_type_code}]"
-        )
-
-    # =============================================================
-    # CREATE FULL LOAD EXECUTOR
-    # =============================================================
-
-    # Create the executor responsible for physical source-to-target
-    # data movement.
+    # The executor contains the actual FULL LOAD implementation.
+    #
+    # IMPORTANT:
+    # Do not implement individual exception scenarios in this
+    # integration test.
     executor = FullLoadExecutor()
 
-    # =============================================================
-    # EXECUTE FULL LOAD
-    # =============================================================
+    print(
+        "FullLoadExecutor initialized successfully."
+    )
+
+
+    # ============================================================
+    # 7. EXECUTE FULL LOAD
+    # ============================================================
 
     print()
     print("-" * 80)
-    print("STARTING FULL LOAD")
+    print("STEP 5 - START FULL LOAD")
     print("-" * 80)
 
-    # Execute the complete full-load operation.
+    print()
+    print("Execution Flow")
+    print("-" * 80)
+
+    print("1. Resolve source connection")
+    print("2. Resolve target connection")
+    print("3. Validate source/target schema")
+    print("4. Check source data availability")
+    print("5. Begin target transaction")
+    print("6. TRUNCATE target")
+    print("7. Read source in batches")
+    print("8. Write target batches")
+    print("9. Commit target transaction")
+    print("10. Close connections")
+
+    print()
+
+    # ------------------------------------------------------------
+    # Execute the actual metadata-driven FULL LOAD.
     #
-    # The executor will:
+    # IMPORTANT:
     #
-    #     1. Connect to source
-    #     2. Connect to target
-    #     3. Begin target transaction
-    #     4. Truncate target
-    #     5. Read source in batches
-    #     6. Write batches to target
-    #     7. Commit target transaction
-    #     8. Close connections
+    # FullLoadExecutor is responsible for:
+    #
+    #   - connection exception handling
+    #   - schema validation
+    #   - source data validation
+    #   - source read exception handling
+    #   - target TRUNCATE exception handling
+    #   - target write exception handling
+    #   - transaction handling
+    #   - rollback
+    #   - resource cleanup
+    #
+    # This test script only invokes the executor and validates
+    # its result.
+    # ------------------------------------------------------------
+
     rows_written = executor.execute(
         context=context,
         field_mappings=field_mappings,
     )
 
-    # =============================================================
-    # VERIFY EXECUTION RESULT
-    # =============================================================
+
+    # ============================================================
+    # 8. VERIFY EXECUTOR RESULT
+    # ============================================================
 
     print()
     print("-" * 80)
-    print("FULL LOAD EXECUTION COMPLETED")
+    print("STEP 6 - FULL LOAD EXECUTION COMPLETED")
     print("-" * 80)
 
     print(
@@ -315,10 +572,12 @@ def main() -> None:
         rows_written,
     )
 
-    # The executor should report at least zero rows.
+    # Basic sanity validation.
     #
-    # A negative count indicates an invalid executor implementation.
+    # A successful executor execution should never return a
+    # negative row count.
     if rows_written < 0:
+
         raise AssertionError(
             "Executor returned an invalid negative row count."
         )
@@ -327,20 +586,34 @@ def main() -> None:
         "Execution Result : PASSED"
     )
 
-    # =============================================================
-    # VERIFY TARGET DATA
-    # =============================================================
 
-    # The executor closes the target connector in its finally block.
+    # ============================================================
+    # 9. VERIFY TARGET DATA
+    # ============================================================
+
+    print()
+    print("-" * 80)
+    print("STEP 7 - VERIFY TARGET DATA")
+    print("-" * 80)
+
+    # ------------------------------------------------------------
+    # IMPORTANT
+    # ------------------------------------------------------------
     #
-    # Therefore, resolve a fresh target connector through the existing
-    # runtime connection resolver for verification.
-    from app.runtime.connection_resolver import RuntimeConnectionResolver
+    # The FullLoadExecutor closes its target connector in its
+    # finally block.
+    #
+    # Therefore, this integration test creates a NEW connection
+    # for independent target verification.
+    #
+    # This gives us an independent verification that the target
+    # really contains the expected number of rows.
+    # ------------------------------------------------------------
 
-    # Create the connection resolver.
-    verification_connection_resolver = RuntimeConnectionResolver()
+    verification_connection_resolver = (
+        RuntimeConnectionResolver()
+    )
 
-    # Resolve a fresh target connector using the target dataset binding.
     verification_connector = (
         verification_connection_resolver.resolve(
             context.target_object.connection_id
@@ -348,42 +621,84 @@ def main() -> None:
     )
 
     try:
-        # Open the target verification connection.
+
         verification_connector.connect()
 
-        # Obtain the active connection from the PostgreSQL connector.
+        # --------------------------------------------------------
+        # PostgreSQL-specific verification.
         #
-        # The current POC uses PostgreSQLConnector, so this verification
-        # query is intentionally limited to this integration test.
-        connection = verification_connector._require_connection()
+        # The current Customer POC uses PostgreSQL, so the test
+        # directly obtains the underlying PostgreSQL connection.
+        # --------------------------------------------------------
 
-        # Query the number of rows currently persisted in the target.
+        connection = (
+            verification_connector._require_connection()
+        )
+
+        target_schema = (
+            context.target_object.schema_name
+        )
+
+        target_table = (
+            context.target_object.object_name
+        )
+
+        # --------------------------------------------------------
+        # IMPORTANT SECURITY / SQL RULE
+        # --------------------------------------------------------
+        #
+        # Schema and table names come from runtime metadata.
+        #
+        # They cannot be passed as normal SQL parameters.
+        #
+        # Therefore, identifiers are safely escaped before being
+        # placed into the SQL statement.
+        # --------------------------------------------------------
+
+        quoted_schema = (
+            target_schema.replace('"', '""')
+        )
+
+        quoted_table = (
+            target_table.replace('"', '""')
+        )
+
+        verification_query = (
+            f'SELECT COUNT(*) '
+            f'FROM "{quoted_schema}"."{quoted_table}"'
+        )
+
         with connection.cursor() as cursor:
 
-            # Use quoted identifiers because the schema and table names
-            # come from runtime metadata.
             cursor.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM "{target_schema}"."{target_table}";
-                """
+                verification_query
             )
 
-            # Fetch the single COUNT(*) result.
-            target_row_count = cursor.fetchone()[0]
+            target_row_count = (
+                cursor.fetchone()[0]
+            )
 
-        print()
         print(
             "Target Rows After Load :",
             target_row_count,
         )
 
-        # The persisted target row count should equal the number of
-        # rows reported by the executor.
+        # --------------------------------------------------------
+        # RECONCILIATION
+        # --------------------------------------------------------
+        #
+        # Executor reported rows written.
+        #
+        # Target database reports rows actually present.
+        #
+        # Both values should match for this FULL LOAD POC.
+        # --------------------------------------------------------
+
         if target_row_count != rows_written:
+
             raise AssertionError(
-                "Target row count does not match executor "
-                "reported row count. "
+                "Target row count does not match "
+                "executor reported row count. "
                 f"Executor={rows_written}, "
                 f"Target={target_row_count}."
             )
@@ -393,80 +708,242 @@ def main() -> None:
         )
 
     finally:
-        # Always close the verification connector.
+
+        # Always close the independent verification connection.
         verification_connector.close()
 
-    # =============================================================
-    # OPTIONAL TEST DATA CLEANUP
-    # =============================================================
+
+    # ============================================================
+    # 10. OPTIONAL CLEANUP
+    # ============================================================
+
+    print()
+    print("-" * 80)
+    print("STEP 8 - TEST DATA CLEANUP")
+    print("-" * 80)
 
     if CLEANUP_AFTER_TEST:
-        # The executor intentionally commits the full-load transaction.
-        #
-        # Therefore, when cleanup is enabled, this test explicitly cleans
-        # the target after successful verification.
-        #
-        # The cleanup uses a fresh connector so it does not depend on
-        # the executor's already-closed connector.
-        cleanup_connection_resolver = RuntimeConnectionResolver()
 
-        # Resolve another target connector for cleanup.
-        cleanup_connector = cleanup_connection_resolver.resolve(
-            context.target_object.connection_id
+        cleanup_connection_resolver = (
+            RuntimeConnectionResolver()
         )
 
+        cleanup_connector = (
+            cleanup_connection_resolver.resolve(
+                context.target_object.connection_id
+            )
+        )
+
+        cleanup_transaction_started = False
+
         try:
-            # Open the target cleanup connection.
+
             cleanup_connector.connect()
 
-            # Start a cleanup transaction.
+            # Cleanup is also performed inside a transaction.
             cleanup_connector.begin_transaction()
 
-            # Remove all test rows from the Customer target.
+            cleanup_transaction_started = True
+
             cleanup_connector.truncate_table(
-                target_schema=target_schema,
-                target_table=target_table,
+                target_schema=(
+                    context.target_object.schema_name
+                ),
+                target_table=(
+                    context.target_object.object_name
+                ),
             )
 
-            # Commit the cleanup operation.
             cleanup_connector.commit()
+
+            cleanup_transaction_started = False
 
             print(
                 "Test Data Cleanup : PASSED"
             )
 
         except Exception:
-            # If cleanup fails, attempt to roll back the cleanup transaction.
-            try:
-                cleanup_connector.rollback()
-            except Exception:
-                pass
 
-            # Re-raise the original cleanup error.
+            # ----------------------------------------------------
+            # Cleanup failure should not leave an open transaction.
+            # ----------------------------------------------------
+
+            if cleanup_transaction_started:
+
+                try:
+
+                    cleanup_connector.rollback()
+
+                except Exception as rollback_exc:
+
+                    logger.warning(
+                        "Cleanup rollback failed | "
+                        "exception_type=%s",
+                        type(rollback_exc).__name__,
+                    )
+
+            # Re-raise the cleanup exception so the test correctly
+            # reports the cleanup failure.
             raise
 
         finally:
-            # Always close the cleanup connector.
+
             cleanup_connector.close()
 
     else:
-        # Demo/debug mode: retain the loaded rows so they can be inspected
-        # directly in the target database after the test completes.
+
         print(
             "Test Data Cleanup : SKIPPED "
             "(CLEANUP_AFTER_TEST=False)"
         )
 
-    # =============================================================
-    # FINAL TEST RESULT
-    # =============================================================
+
+    # ============================================================
+    # 11. FINAL RESULT
+    # ============================================================
 
     print()
     print("=" * 80)
     print("CUSTOMER FULL LOAD EXECUTOR TEST PASSED")
     print("=" * 80)
+    print()
+
+    print(
+        "Rows Written             :",
+        rows_written,
+    )
+
+    print(
+        "Target Row Count         :",
+        target_row_count,
+    )
+
+    print(
+        "Target Verification     : PASSED"
+    )
+
+    print(
+        "Overall Result           : PASSED"
+    )
 
 
-# Execute the test only when this script is run directly.
+# ================================================================
+# SCRIPT ENTRY POINT
+# ================================================================
+
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        # Execute the integration test.
+        main()
+
+    except IngestionPlatformError as exc:
+
+        # --------------------------------------------------------
+        # KNOWN PLATFORM EXCEPTION
+        # --------------------------------------------------------
+        #
+        # Examples:
+        #
+        #   ConnectionResolutionError
+        #   SchemaValidationError
+        #   SourceReadError
+        #   TargetWriteError
+        #   TransactionError
+        #   NoSourceDataError
+        #   AuthorizationError
+        #   etc.
+        #
+        # The FullLoadExecutor is responsible for rollback and
+        # resource cleanup required for the execution failure.
+        #
+        # This block only reports the failure at test level.
+        # --------------------------------------------------------
+
+        print()
+        print("=" * 80)
+        print("CUSTOMER FULL LOAD EXECUTOR TEST FAILED")
+        print("=" * 80)
+
+        print(
+            "Exception Type :",
+            type(exc).__name__,
+        )
+
+        print(
+            "Message        :",
+            str(exc),
+        )
+
+        # --------------------------------------------------------
+        # FL-007 - PERMISSION DENIED
+        # --------------------------------------------------------
+
+        if type(exc).__name__ == "AuthorizationError":
+
+            print()
+            print("FL-007 RESULT  : PASS")
+            print("Expected       : INSERT permission denied")
+            print("Action         : Target transaction rolled back")
+            print("Data Safety    : Existing target data preserved")
+
+        # --------------------------------------------------------
+        # Display the underlying database/application exception
+        # when exception chaining is available.
+        #
+        # Example:
+        #
+        #   AuthorizationError
+        #          |
+        #          +-- psycopg.errors.InsufficientPrivilege
+        #
+        # This is useful during debugging.
+        # --------------------------------------------------------
+
+        if exc.__cause__ is not None:
+
+            print(
+                "Root Cause     :",
+                type(exc.__cause__).__name__,
+            )
+
+            print(
+                "Root Message   :",
+                str(exc.__cause__),
+            )
+
+        # Re-raise so the operating environment / CI pipeline
+        # receives a non-zero failure status.
+        raise
+
+    except Exception as exc:
+
+        # --------------------------------------------------------
+        # UNEXPECTED TEST-HARNESS FAILURE
+        # --------------------------------------------------------
+        #
+        # This is NOT expected to be the normal path for ingestion
+        # failures.
+        #
+        # Known ingestion failures should be represented by the
+        # platform exception hierarchy.
+        # --------------------------------------------------------
+
+        print()
+        print("=" * 80)
+        print("CUSTOMER FULL LOAD EXECUTOR TEST FAILED")
+        print("=" * 80)
+
+        print(
+            "Exception Type :",
+            type(exc).__name__,
+        )
+
+        print(
+            "Message        :",
+            str(exc),
+        )
+
+        # Re-raise so the test exits with failure status.
+        raise

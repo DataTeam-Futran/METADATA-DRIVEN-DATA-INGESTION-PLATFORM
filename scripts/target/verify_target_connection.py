@@ -90,7 +90,7 @@ def main() -> None:
                 FROM conn.connection_profile
                 WHERE connection_id = %s;
                 """,
-                (10,),
+                (11,),
             )
 
             target_connection = cursor.fetchone()

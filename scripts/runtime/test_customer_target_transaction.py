@@ -1,231 +1,94 @@
-"""
-Customer Target Transaction Test
-=================================
 
-Purpose
--------
-Validate the complete target-side transaction behavior.
+"""Metadata-driven target transaction rollback integration test."""
 
-Test flow
----------
-    BEGIN
-      |
-      +-- TRUNCATE target
-      |
-      +-- INSERT 2 test rows
-      |
-      +-- Verify rows
-      |
-    ROLLBACK
-      |
-      +-- Verify original target state is restored
-
-WHY
----
-Before building the Full Load Executor, we need to prove that
-TRUNCATE, INSERT, COMMIT/ROLLBACK work correctly as one target
-transaction.
-
-IMPORTANT
----------
-This test intentionally uses ROLLBACK.
-
-No test data will be permanently committed.
-"""
-
-from app.runtime.connection_resolver import RuntimeConnectionResolver
+from target_write_test_helpers import (
+    build_test_rows,
+    inspect_writable_columns,
+    resolve_target,
+    verify_marker_count,
+)
 
 
-def main() -> None:
-    """
-    Test the target transaction lifecycle.
-    """
-
+def main():
     print("=" * 70)
-    print("CUSTOMER TARGET TRANSACTION TEST")
+    print("METADATA-DRIVEN TARGET TRANSACTION TEST")
     print("=" * 70)
 
-    # ---------------------------------------------------------
-    # Resolve target connector
-    # ---------------------------------------------------------
-
-    # Connection ID 11 represents the metadata-defined target
-    # PostgreSQL connection.
-    connection_resolver = RuntimeConnectionResolver()
-
-    target_connector = connection_resolver.resolve(
-        connection_id=11,
-    )
+    connector, target_object = resolve_target()
+    connection = None
+    rollback_verified = False
 
     try:
-        # -----------------------------------------------------
-        # Connect to target
-        # -----------------------------------------------------
+        connection = connector.connect()
+        connector.begin_transaction()
 
-        target_connector.connect()
+        print(
+            f"Target object : {target_object.catalog_name}."
+            f"{target_object.schema_name}.{target_object.object_name}"
+        )
+        print("Transaction   : BEGIN")
 
-        print()
-        print("Target Connection : OPEN")
+        columns, marker_column = inspect_writable_columns(
+            connection, target_object
+        )
+        column_names = [column["name"] for column in columns]
 
-        # -----------------------------------------------------
-        # Begin transaction
-        # -----------------------------------------------------
-
-        # The PostgreSQL connector validates that an active
-        # connection exists.
-        target_connector.begin_transaction()
-
-        print("Transaction : BEGIN")
-
-        # -----------------------------------------------------
-        # Truncate target
-        # -----------------------------------------------------
-
-        # The current full-load strategy is TRUNCATE_INSERT.
-        #
-        # IMPORTANT:
-        # truncate_table() does not commit.
-        target_connector.truncate_table(
-            target_schema="warehouse",
-            target_table="customer_target",
+        marker_values, test_rows = build_test_rows(
+            connection, target_object, columns, marker_column
         )
 
-        print("Target TRUNCATE : PASSED")
-
-        # -----------------------------------------------------
-        # Prepare temporary test rows
-        # -----------------------------------------------------
-
-        test_rows = [
-            (
-                900001,
-                "MDIP Transaction Test 1",
-                "transaction-test-1@example.com",
-                "Test City",
-            ),
-            (
-                900002,
-                "MDIP Transaction Test 2",
-                "transaction-test-2@example.com",
-                "Test City",
-            ),
-        ]
-
-        target_columns = [
-            "customer_id",
-            "customer_name",
-            "email",
-            "city",
-        ]
-
-        # -----------------------------------------------------
-        # Insert test batch
-        # -----------------------------------------------------
-
-        rows_written = target_connector.write_batch(
-            target_schema="warehouse",
-            target_table="customer_target",
-            column_names=target_columns,
+        rows_written = connector.write_batch(
+            target_schema=target_object.schema_name,
+            target_table=target_object.object_name,
+            column_names=column_names,
             rows=test_rows,
         )
 
-        print(
-            f"Rows Written : {rows_written}"
-        )
-
-        # -----------------------------------------------------
-        # Verify rows inside transaction
-        # -----------------------------------------------------
-
-        # We use the connector-managed connection only for this
-        # verification query.
-        #
-        # This is still inside the same transaction.
-        connection = target_connector._require_connection()
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-                FROM "warehouse"."customer_target"
-                WHERE "customer_id" IN (900001, 900002);
-                """
-            )
-
-            row = cursor.fetchone()
-
-        rows_found = row[0]
-
-        print(
-            f"Rows Visible Before Rollback : {rows_found}"
-        )
-
-        if rows_found != 2:
+        if rows_written != len(test_rows):
             raise RuntimeError(
-                "Expected 2 test rows before rollback, "
-                f"but found {rows_found}."
+                f"Expected {len(test_rows)} inserted rows; "
+                f"connector reported {rows_written}."
             )
 
-        print("Pre-Rollback Verification : PASSED")
-
-        # -----------------------------------------------------
-        # Roll back transaction
-        # -----------------------------------------------------
-
-        # This should undo BOTH:
-        #
-        #   1. TRUNCATE
-        #   2. INSERT
-        #
-        # Therefore the original target state should be restored.
-        target_connector.rollback()
-
-        print("Transaction ROLLBACK : PASSED")
-
-        # -----------------------------------------------------
-        # Verify rollback
-        # -----------------------------------------------------
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-                FROM "warehouse"."customer_target"
-                WHERE "customer_id" IN (900001, 900002);
-                """
-            )
-
-            row = cursor.fetchone()
-
-        rows_after_rollback = row[0]
-
-        print(
-            f"Test Rows After Rollback : "
-            f"{rows_after_rollback}"
+        before_rollback = verify_marker_count(
+            connection, target_object, marker_column, marker_values
         )
-
-        if rows_after_rollback != 0:
+        if before_rollback != len(test_rows):
             raise RuntimeError(
-                "Rollback verification failed. "
-                "Test rows still exist."
+                "Expected inserted test rows to be visible before rollback."
             )
 
-        print("Rollback Verification : PASSED")
-        print("Test Data Persisted : NO")
+        print("Pre-rollback verification: PASSED")
+
+        connector.rollback()
+        rollback_verified = True
+
+        after_rollback = verify_marker_count(
+            connection, target_object, marker_column, marker_values
+        )
+        if after_rollback != 0:
+            raise RuntimeError(
+                "Rollback verification failed: temporary rows remain."
+            )
+
+        print("Rollback verification   : PASSED")
+        print("Target truncate         : NOT PERFORMED")
+        print("Test rows persisted     : NO")
+
 
     finally:
-        # -----------------------------------------------------
-        # Close target connection
-        # -----------------------------------------------------
+        try:
+            if connection is not None and not rollback_verified:
+                try:
+                    connector.rollback()
+                    print("Cleanup rollback       : COMPLETED")
+                except Exception as exc:
+                    print(f"CRITICAL: rollback failed: {exc}")
+                    raise
+        finally:
+            connector.close()
+            print("Target connection      : CLOSED")
 
-        target_connector.close()
-
-        print("Target Connection : CLOSED")
-
-    print()
-    print("=" * 70)
-    print("CUSTOMER TARGET TRANSACTION TEST PASSED")
-    print("=" * 70)
 
 
 if __name__ == "__main__":

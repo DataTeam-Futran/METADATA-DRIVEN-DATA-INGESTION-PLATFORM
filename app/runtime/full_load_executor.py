@@ -1,537 +1,865 @@
+
 """
 Full Load Executor
 ==================
 
-Purpose
--------
 Executes a metadata-driven FULL LOAD from a source physical object
 to a target physical object.
 
-Current supported execution pattern
------------------------------------
-    FULL
-      +
-    TRUNCATE_INSERT
-      +
-    DIRECT field mappings
+Supported execution pattern:
+    FULL + TRUNCATE_INSERT + DIRECT field mappings
 
-Execution flow
---------------
-    RuntimeExecutionContext
-            +
-    RuntimeFieldMapping[]
-            |
-            v
-    FullLoadExecutor
-            |
-            +--> Connect source
-            |
-            +--> Connect target
-            |
-            +--> Begin target transaction
-            |
-            +--> Truncate target
-            |
-            +--> Read source in batches
-            |
-            +--> Write each batch to target
-            |
-            +--> Commit target transaction
-            |
-            +--> Close connections
-
-Failure flow
-------------
-    Any execution error
-            |
-            v
-       Target rollback
-            |
-            v
-       Close connections
-            |
-            v
-       Re-raise error
-
-Important
----------
-This executor does NOT query metadata tables directly.
-
-All metadata required for execution must already be resolved into:
-
-    RuntimeExecutionContext
-    RuntimeFieldMapping
-
-This keeps metadata resolution separate from physical data movement.
+Features:
+    - Source and target connection management
+    - Physical schema and datatype validation
+    - Batched source extraction and target insertion
+    - Source-to-target row-count reconciliation
+    - Transaction commit and rollback
+    - Execution logging and exception classification
 """
 
-# Any is used for generic row values returned by database connectors.
+from __future__ import annotations
+
+import logging
 from typing import Any
 
-# BaseConnector provides the vendor-neutral connector contract.
+import psycopg
+import pyodbc
+
 from app.connectors.base import BaseConnector
-
-# Runtime execution context contains the resolved source/target objects
-# and their corresponding connectors.
 from app.runtime.execution_context import RuntimeExecutionContext
-
-# RuntimeFieldMapping contains the resolved source-to-target field mapping.
 from app.runtime.models import RuntimeFieldMapping
+
+from app.core.exceptions import (
+    AuthorizationError,
+    ConnectionResolutionError,
+    DataQualityError,
+    IngestionPlatformError,
+    MappingResolutionError,
+    MetadataResolutionError,
+    NoSourceDataError,
+    SchemaValidationError,
+    SourceReadError,
+    TargetWriteError,
+    TransactionError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class FullLoadExecutor:
-    """
-    Executes one metadata-driven full-load operation.
-
-    The executor is intentionally database-agnostic.
-
-    It interacts only with BaseConnector methods, so the same execution
-    logic can eventually work with:
-
-        PostgreSQL
-        MySQL
-        SQL Server
-        Oracle
-        Snowflake
-        Databricks
-        etc.
-
-    Database-specific behavior remains inside the connector layer.
-    """
+    """Execute a metadata-driven FULL/TRUNCATE_INSERT load."""
 
     def execute(
         self,
         context: RuntimeExecutionContext,
         field_mappings: list[RuntimeFieldMapping],
     ) -> int:
-        """
-        Execute the full source-to-target load.
+        """Execute a full load and return the number of rows written."""
 
-        Parameters
-        ----------
-        context:
-            Complete runtime execution context containing:
-
-                - execution plan
-                - source object
-                - target object
-                - source connector
-                - target connector
-
-        field_mappings:
-            Resolved source-to-target field mappings.
-
-        Returns
-        -------
-        int
-            Total number of rows written to the target.
-
-        Raises
-        ------
-        ValueError
-            When the execution configuration is invalid.
-
-        RuntimeError
-            When runtime execution fails.
-
-        Important
-        ---------
-        The target transaction is controlled entirely by this method.
-
-        Therefore:
-
-            BEGIN
-            TRUNCATE
-            INSERT batches
-            COMMIT
-
-        or, on failure:
-
-            BEGIN
-            TRUNCATE
-            INSERT batches
-            ROLLBACK
-        """
-
-        # ---------------------------------------------------------
-        # VALIDATE EXECUTION INPUT
-        # ---------------------------------------------------------
-
-        # A runtime context is mandatory because it contains all
-        # physical source/target information required for execution.
+        # =========================================================
+        # 1. INITIAL VALIDATION
+        # =========================================================
         if context is None:
-            raise ValueError(
-                "Runtime execution context must not be None."
+            raise MetadataResolutionError(
+                "Runtime execution context is missing."
             )
 
-        # At least one source-to-target field mapping is required.
         if not field_mappings:
-            raise ValueError(
-                "At least one field mapping is required "
-                "for full-load execution."
+            raise MappingResolutionError(
+                "No active source-to-target field mappings were supplied."
             )
 
-        # ---------------------------------------------------------
-        # READ EXECUTION CONFIGURATION
-        # ---------------------------------------------------------
+        # =========================================================
+        # 2. READ EXECUTION CONFIGURATION
+        # =========================================================
+        try:
+            execution_plan = context.execution_plan
+            mapping = execution_plan.mapping
+            load_config = execution_plan.load_config
+            target_config = execution_plan.target_config
+        except Exception as exc:
+            raise MetadataResolutionError(
+                "Required runtime execution configuration "
+                "could not be resolved."
+            ) from exc
 
-        # The execution plan was already resolved from metadata.
-        execution_plan = context.execution_plan
+        # Reserved for future target-specific configuration.
+        _ = target_config
 
-        # Mapping configuration defines the logical load type and
-        # physical load strategy.
-        mapping = execution_plan.mapping
+        # =========================================================
+        # 3. VALIDATE LOAD TYPE AND STRATEGY
+        # =========================================================
+        if not mapping:
+            raise MetadataResolutionError(
+                "Execution mapping configuration is missing."
+            )
 
-        # Generic load configuration contains the batch size and
-        # truncate behavior.
-        load_config = execution_plan.load_config
+        if mapping.load_type_code is None:
+            raise MetadataResolutionError(
+                "Load type is missing from execution configuration."
+            )
 
-        # Target configuration controls target-side execution behavior.
-        target_config = execution_plan.target_config
+        if mapping.load_strategy_code is None:
+            raise MetadataResolutionError(
+                "Load strategy is missing from execution configuration."
+            )
 
-        # ---------------------------------------------------------
-        # VALIDATE CURRENT FULL-LOAD POC
-        # ---------------------------------------------------------
-
-        # The first runtime implementation intentionally supports
-        # only FULL load.
         if mapping.load_type_code.upper() != "FULL":
-            raise ValueError(
+            raise MetadataResolutionError(
                 "FullLoadExecutor supports only FULL load. "
-                f"Received load_type_code="
-                f"'{mapping.load_type_code}'."
+                f"Received load_type_code='{mapping.load_type_code}'."
             )
 
-        # The current implementation supports the TRUNCATE_INSERT
-        # strategy only.
         if mapping.load_strategy_code.upper() != "TRUNCATE_INSERT":
-            raise ValueError(
-                "FullLoadExecutor supports only "
-                "TRUNCATE_INSERT strategy. "
+            raise MetadataResolutionError(
+                "FullLoadExecutor supports only TRUNCATE_INSERT strategy. "
                 f"Received load_strategy_code="
                 f"'{mapping.load_strategy_code}'."
             )
 
-        # A positive batch size is required for controlled source
-        # extraction.
+        # =========================================================
+        # 4. VALIDATE LOAD CONFIGURATION
+        # =========================================================
+        if load_config is None:
+            raise MetadataResolutionError(
+                "Load configuration is missing."
+            )
+
         if load_config.batch_size <= 0:
-            raise ValueError(
-                "Load configuration batch_size must be "
-                "greater than zero."
+            raise DataQualityError(
+                "Load configuration batch_size must be greater than zero."
             )
 
-        # The current strategy requires target truncation.
         if not load_config.truncate_before_load:
-            raise ValueError(
-                "TRUNCATE_INSERT requires "
-                "truncate_before_load=True."
+            raise DataQualityError(
+                "TRUNCATE_INSERT requires truncate_before_load=True."
             )
 
-        # ---------------------------------------------------------
-        # RESOLVE SOURCE/TARGET OBJECT INFORMATION
-        # ---------------------------------------------------------
-
-        # Source physical object was already resolved by the
-        # RuntimeObjectResolver.
+        # =========================================================
+        # 5. RESOLVE OBJECTS AND CONNECTORS
+        # =========================================================
         source_object = context.source_object
-
-        # Target physical object was already resolved by the
-        # RuntimeObjectResolver.
         target_object = context.target_object
-
-        # Source connector is responsible for reading source data.
         source_connector = context.source_connector
-
-        # Target connector is responsible for preparing and writing
-        # target data.
         target_connector = context.target_connector
 
-        # ---------------------------------------------------------
-        # VALIDATE PHYSICAL OBJECT INFORMATION
-        # ---------------------------------------------------------
+        if source_object is None:
+            raise MetadataResolutionError(
+                "Source physical object is missing from runtime context."
+            )
 
-        # A source schema is required for the generated SELECT.
+        if target_object is None:
+            raise MetadataResolutionError(
+                "Target physical object is missing from runtime context."
+            )
+
+        if source_connector is None:
+            raise ConnectionResolutionError(
+                "Source connector is missing from runtime context."
+            )
+
+        if target_connector is None:
+            raise ConnectionResolutionError(
+                "Target connector is missing from runtime context."
+            )
+
+        # =========================================================
+        # 6. VALIDATE PHYSICAL OBJECT INFORMATION
+        # =========================================================
         if not source_object.schema_name:
-            raise ValueError(
-                "Source schema is required for full-load execution."
-            )
+            raise SchemaValidationError("Source schema is missing.")
 
-        # A source object name is required for the generated SELECT.
         if not source_object.object_name:
-            raise ValueError(
-                "Source object name is required for full-load execution."
+            raise SchemaValidationError(
+                "Source table/object name is missing."
             )
 
-        # A target schema is required for target preparation and writes.
         if not target_object.schema_name:
-            raise ValueError(
-                "Target schema is required for full-load execution."
-            )
+            raise SchemaValidationError("Target schema is missing.")
 
-        # A target object name is required for target preparation and writes.
         if not target_object.object_name:
-            raise ValueError(
-                "Target object name is required for full-load execution."
+            raise SchemaValidationError(
+                "Target table/object name is missing."
             )
 
-        # ---------------------------------------------------------
-        # BUILD FIELD LISTS
-        # ---------------------------------------------------------
+        # =========================================================
+        # 7. VALIDATE AND ORDER FIELD MAPPINGS
+        # =========================================================
+        try:
+            ordered_mappings = sorted(
+                field_mappings,
+                key=lambda item: item.ordinal_no,
+            )
+        except Exception as exc:
+            raise MappingResolutionError(
+                "Unable to order runtime field mappings."
+            ) from exc
 
-        # Sort mappings explicitly by metadata ordinal.
-        #
-        # WHY:
-        # ----
-        # The source SELECT column order must match the target INSERT
-        # column order and the row values returned by the source query.
-        ordered_mappings = sorted(
-            field_mappings,
-            key=lambda mapping_item: mapping_item.ordinal_no,
-        )
+        if not ordered_mappings:
+            raise MappingResolutionError(
+                "No valid field mappings are available."
+            )
 
-        # Ensure every mapping is a DIRECT mapping for this first
-        # implementation.
+        source_columns: list[str] = []
+        target_columns: list[str] = []
+
         for mapping_item in ordered_mappings:
-            if mapping_item.mapping_type_code.upper() != "DIRECT":
-                raise ValueError(
-                    "FullLoadExecutor currently supports only "
-                    "DIRECT field mappings. "
-                    f"Mapping field "
-                    f"{mapping_item.mapping_field_id} uses "
-                    f"'{mapping_item.mapping_type_code}'."
+            if mapping_item is None:
+                raise MappingResolutionError(
+                    "Runtime field mapping contains a null mapping."
                 )
 
-        # Extract source column names in runtime mapping order.
-        source_columns = [
-            mapping_item.source_field_name
-            for mapping_item in ordered_mappings
-        ]
+            if not mapping_item.source_field_name:
+                raise MappingResolutionError(
+                    "A source field is missing from the runtime mapping."
+                )
 
-        # Extract target column names in the same runtime mapping order.
-        target_columns = [
-            mapping_item.target_field_name
-            for mapping_item in ordered_mappings
-        ]
+            if not mapping_item.target_field_name:
+                raise MappingResolutionError(
+                    "A target field is missing from the runtime mapping."
+                )
 
-        # ---------------------------------------------------------
-        # BUILD SOURCE SELECT
-        # ---------------------------------------------------------
+            mapping_type = mapping_item.mapping_type_code
 
-        # The source connector is responsible for vendor-specific
-        # execution, but the executor must construct a safe logical
-        # SELECT statement.
-        #
-        # The connector implementation currently supports PostgreSQL,
-        # so PostgreSQL identifier quoting is appropriate for this POC.
-        #
-        # IMPORTANT:
-        # Values are not concatenated into the SQL.
-        # Only metadata-derived identifiers are inserted here.
-        select_columns = ", ".join(
-            self._quote_identifier(column_name)
-            for column_name in source_columns
-        )
+            if mapping_type is None or mapping_type.upper() != "DIRECT":
+                raise MappingResolutionError(
+                    "FullLoadExecutor currently supports only "
+                    "DIRECT field mappings. "
+                    f"Mapping field {mapping_item.mapping_field_id} "
+                    f"uses '{mapping_type}'."
+                )
 
-        # Quote the physical source schema.
-        source_schema = self._quote_identifier(
-            source_object.schema_name
-        )
+            source_columns.append(mapping_item.source_field_name)
+            target_columns.append(mapping_item.target_field_name)
 
-        # Quote the physical source object.
-        source_table = self._quote_identifier(
-            source_object.object_name
-        )
-
-        # Construct the source extraction query.
-        source_query = (
-            f"SELECT {select_columns} "
-            f"FROM {source_schema}.{source_table}"
-        )
-
-        # ---------------------------------------------------------
-        # EXECUTION STATE
-        # ---------------------------------------------------------
-
-        # Track the total number of rows successfully sent to the
-        # target connector.
+        # =========================================================
+        # 8. EXECUTION STATE
+        # =========================================================
         total_rows_written = 0
+        total_source_rows_read = 0
+        batch_number = 0
 
-        # Track whether the target transaction has started.
-        #
-        # WHY:
-        # ----
-        # We should only attempt rollback when this executor actually
-        # entered the target transaction.
         transaction_started = False
+        source_connected = False
+        target_connected = False
 
+        # =========================================================
+        # 9. CONNECT SOURCE
+        # =========================================================
+        try:
+            source_connector.connect()
+            source_connected = True
+
+            logger.info("Source connection established.")
+
+        except Exception as exc:
+            raise ConnectionResolutionError(
+                "Unable to establish source database connection."
+            ) from exc
+
+        # =========================================================
+        # 10. CONNECT TARGET
+        #
+        # FIX: If target connection fails, close the source before
+        # raising the error. The main finally block has not started
+        # yet, so this cleanup must happen here.
+        # =========================================================
+        try:
+            target_connector.connect()
+            target_connected = True
+
+            logger.info("Target connection established.")
+
+        except Exception as exc:
+            if source_connected:
+                try:
+                    source_connector.close()
+                except Exception as close_exc:
+                    logger.warning(
+                        "Source connection cleanup failed after target "
+                        "connection failure | exception_type=%s",
+                        type(close_exc).__name__,
+                    )
+                finally:
+                    source_connected = False
+
+            raise ConnectionResolutionError(
+                "Unable to establish target database connection."
+            ) from exc
+
+        # =========================================================
+        # 11. MAIN EXECUTION
+        # =========================================================
         try:
             # -----------------------------------------------------
-            # CONNECT SOURCE
+            # 11A. PHYSICAL SCHEMA AND DATATYPE VALIDATION
             # -----------------------------------------------------
-
-            # Establish the physical source database connection.
-            source_connector.connect()
-
-            # -----------------------------------------------------
-            # CONNECT TARGET
-            # -----------------------------------------------------
-
-            # Establish the physical target database connection.
-            target_connector.connect()
-
-            # -----------------------------------------------------
-            # START TARGET TRANSACTION
-            # -----------------------------------------------------
-
-            # The target transaction contains TRUNCATE plus all
-            # INSERT batches.
-            target_connector.begin_transaction()
-
-            # Record that rollback is now required if execution fails.
-            transaction_started = True
-
-            # -----------------------------------------------------
-            # PREPARE TARGET
-            # -----------------------------------------------------
-
-            # The current FULL_LOAD configuration uses
-            # TRUNCATE_INSERT.
-            #
-            # Therefore existing target rows are removed before
-            # inserting the source dataset.
-            target_connector.truncate_table(
-                target_schema=target_object.schema_name,
-                target_table=target_object.object_name,
+            # This must complete before source extraction and
+            # before target transaction/TRUNCATE.
+            self._validate_physical_schema(
+                source_connector=source_connector,
+                target_connector=target_connector,
+                source_object=source_object,
+                target_object=target_object,
+                source_columns=source_columns,
+                target_columns=target_columns,
             )
 
             # -----------------------------------------------------
-            # READ SOURCE AND WRITE TARGET
+            # 11B. BUILD SOURCE QUERY
             # -----------------------------------------------------
+            select_columns = ", ".join(
+                self._quote_identifier(column)
+                for column in source_columns
+            )
 
-            # Read source records in controlled batches.
-            #
-            # The connector implementation uses a server-side cursor,
-            # preventing the complete source dataset from being loaded
-            # into application memory.
-            for source_batch in source_connector.read_batches(
-                query=source_query,
-                batch_size=load_config.batch_size,
-            ):
-                # Write the current source batch to the target.
-                #
-                # The field mapping is DIRECT, so the source row order
-                # already matches the target column order.
+            source_schema = self._quote_identifier(
+                source_object.schema_name
+            )
+            source_table = self._quote_identifier(
+                source_object.object_name
+            )
+
+            source_query = (
+                f"SELECT {select_columns} "
+                f"FROM {source_schema}.{source_table}"
+            )
+
+            # -----------------------------------------------------
+            # 11C. CHECK SOURCE DATA BEFORE TRUNCATE
+            # -----------------------------------------------------
+            try:
+                source_batches = iter(
+                    source_connector.read_batches(
+                        query=source_query,
+                        batch_size=load_config.batch_size,
+                    )
+                )
+
+                first_batch = next(source_batches, None)
+
+                if first_batch is None:
+                    raise NoSourceDataError(
+                        "Source returned zero records. "
+                        "FULL load stopped before target TRUNCATE."
+                    )
+
+            except NoSourceDataError:
+                raise
+            except Exception as exc:
+                raise SourceReadError(
+                    "Unable to read source data during "
+                    "pre-load source validation."
+                ) from exc
+
+            # -----------------------------------------------------
+            # 11D. START TARGET TRANSACTION
+            # -----------------------------------------------------
+            try:
+                target_connector.begin_transaction()
+                transaction_started = True
+            except Exception as exc:
+                raise TransactionError(
+                    "Unable to begin target transaction."
+                ) from exc
+
+            # -----------------------------------------------------
+            # 11E. TRUNCATE TARGET
+            # -----------------------------------------------------
+            try:
+                target_connector.truncate_table(
+                    target_schema=target_object.schema_name,
+                    target_table=target_object.object_name,
+                )
+
+            except psycopg.errors.LockNotAvailable as exc:
+                raise TransactionError(
+                    "Target TRUNCATE failed because the target table "
+                    "is locked or the lock timeout was exceeded."
+                ) from exc
+
+            except Exception as exc:
+                raise TargetWriteError(
+                    "Target TRUNCATE operation failed."
+                ) from exc
+
+            # -----------------------------------------------------
+            # 11F. WRITE FIRST SOURCE BATCH
+            # -----------------------------------------------------
+            batch_number = 1
+
+            try:
                 rows_written = target_connector.write_batch(
                     target_schema=target_object.schema_name,
                     target_table=target_object.object_name,
                     column_names=target_columns,
-                    rows=source_batch,
+                    rows=first_batch,
                 )
 
-                # Add the current batch count to the execution total.
-                total_rows_written += rows_written
+            except (
+                psycopg.errors.InsufficientPrivilege,
+                pyodbc.ProgrammingError,
+            ) as exc:
+                raise AuthorizationError(
+                    "Permission denied for INSERT on target table."
+                ) from exc
+
+            except Exception as exc:
+                raise TargetWriteError(
+                    f"Target write failed at batch {batch_number}; "
+                    f"rows_processed={total_rows_written}."
+                ) from exc
+
+            total_rows_written += rows_written
+            total_source_rows_read += len(first_batch)
 
             # -----------------------------------------------------
-            # COMMIT TARGET TRANSACTION
+            # 11G. WRITE REMAINING SOURCE BATCHES
             # -----------------------------------------------------
+            try:
+                for source_batch in source_batches:
+                    batch_number += 1
+                    total_source_rows_read += len(source_batch)
 
-            # All source batches completed successfully.
-            #
-            # Commit the complete target load as one logical operation.
-            target_connector.commit()
+                    try:
+                        rows_written = target_connector.write_batch(
+                            target_schema=target_object.schema_name,
+                            target_table=target_object.object_name,
+                            column_names=target_columns,
+                            rows=source_batch,
+                        )
 
-            # The transaction has been successfully completed, so
-            # rollback is no longer required for this execution path.
-            transaction_started = False
+                    except psycopg.errors.InsufficientPrivilege as exc:
+                        raise AuthorizationError(
+                            "Permission denied for INSERT on target table."
+                        ) from exc
 
-            # Return the total number of rows written.
+                    except Exception as exc:
+                        raise TargetWriteError(
+                            f"Target write failed at batch {batch_number}; "
+                            f"rows_processed={total_rows_written}."
+                        ) from exc
+
+                    total_rows_written += rows_written
+
+            except (TargetWriteError, AuthorizationError):
+                raise
+
+            except Exception as exc:
+                raise SourceReadError(
+                    f"Source extraction failed at batch {batch_number}; "
+                    f"rows_processed={total_rows_written}."
+                ) from exc
+
+            # -----------------------------------------------------
+            # 11H. VALIDATE ZERO-WRITE CONDITION
+            # -----------------------------------------------------
+            if total_rows_written == 0:
+                raise DataQualityError(
+                    "Source data was available but no rows were "
+                    "written to the target."
+                )
+
+            # -----------------------------------------------------
+            # 11I. SOURCE-TO-TARGET ROW COUNT RECONCILIATION
+            # -----------------------------------------------------
+            try:
+                target_row_count = target_connector.count_rows(
+                    schema_name=target_object.schema_name,
+                    table_name=target_object.object_name,
+                )
+            except Exception as exc:
+                raise TargetWriteError(
+                    "Unable to verify the target row count "
+                    "after the full load."
+                ) from exc
+
+            logger.info(
+                "Row-count reconciliation | "
+                "source_rows_read=%s | target_rows=%s | rows_written=%s",
+                total_source_rows_read,
+                target_row_count,
+                total_rows_written,
+            )
+
+            if total_source_rows_read != target_row_count:
+                raise DataQualityError(
+                    "Row-count reconciliation failed. "
+                    f"source_rows_read={total_source_rows_read}, "
+                    f"target_rows={target_row_count}, "
+                    f"rows_written={total_rows_written}."
+                )
+
+            logger.info(
+                "Row-count reconciliation passed | "
+                "source_rows=%s | target_rows=%s",
+                total_source_rows_read,
+                target_row_count,
+            )
+
+            # -----------------------------------------------------
+            # 11J. COMMIT
+            # -----------------------------------------------------
+            try:
+                target_connector.commit()
+                transaction_started = False
+            except Exception as exc:
+                raise TransactionError(
+                    "Target transaction commit failed."
+                ) from exc
+
+            # -----------------------------------------------------
+            # 11K. SUCCESS
+            # -----------------------------------------------------
+            logger.info(
+                "FULL LOAD completed successfully | "
+                "batches=%s | source_rows_read=%s | "
+                "target_rows=%s | rows_written=%s",
+                batch_number,
+                total_source_rows_read,
+                target_row_count,
+                total_rows_written,
+            )
+
             return total_rows_written
 
-        except Exception:
-            # -----------------------------------------------------
-            # ROLLBACK TARGET TRANSACTION
-            # -----------------------------------------------------
-
-            # If the target transaction was started, remove all
-            # uncommitted target changes.
-            if transaction_started:
+        # =========================================================
+        # 12. KNOWN PLATFORM EXCEPTIONS
+        # =========================================================
+        except IngestionPlatformError as exc:
+            if transaction_started and target_connected:
                 try:
                     target_connector.rollback()
-                except Exception:
-                    # Do not hide the original execution exception
-                    # if rollback itself encounters a problem.
-                    pass
+                except Exception as rollback_exc:
+                    logger.exception(
+                        "Target rollback failed | "
+                        "original_exception=%s | rollback_exception=%s",
+                        type(exc).__name__,
+                        type(rollback_exc).__name__,
+                    )
 
-            # Re-raise the original exception so the caller receives
-            # the actual failure.
+            logger.exception(
+                "FULL LOAD failed | exception_type=%s | "
+                "batch_number=%s | source_rows_read=%s | "
+                "rows_processed=%s",
+                type(exc).__name__,
+                batch_number,
+                total_source_rows_read,
+                total_rows_written,
+            )
             raise
+
+        # =========================================================
+        # 13. UNEXPECTED EXCEPTION
+        # =========================================================
+        except Exception as exc:
+            if transaction_started and target_connected:
+                try:
+                    target_connector.rollback()
+                except Exception as rollback_exc:
+                    logger.exception(
+                        "Target rollback failed | "
+                        "original_exception=%s | rollback_exception=%s",
+                        type(exc).__name__,
+                        type(rollback_exc).__name__,
+                    )
+
+            logger.exception(
+                "Unexpected FULL LOAD failure | "
+                "exception_type=%s | batch_number=%s | "
+                "source_rows_read=%s | rows_processed=%s",
+                type(exc).__name__,
+                batch_number,
+                total_source_rows_read,
+                total_rows_written,
+            )
+
+            raise IngestionPlatformError(
+                "Unexpected FULL LOAD execution failure."
+            ) from exc
 
         finally:
             # -----------------------------------------------------
-            # CLOSE TARGET CONNECTION
+            # 14. CLOSE TARGET
             # -----------------------------------------------------
-
-            # Always release the target database connection.
-            #
-            # The connector owns the physical connection lifecycle,
-            # so the executor delegates cleanup to the connector.
-            try:
-                target_connector.close()
-            except Exception:
-                # Connection cleanup should not hide an execution
-                # exception that may already be in progress.
-                pass
+            if target_connected:
+                try:
+                    target_connector.close()
+                except Exception as exc:
+                    logger.warning(
+                        "Target connection cleanup failed | "
+                        "exception_type=%s",
+                        type(exc).__name__,
+                    )
 
             # -----------------------------------------------------
-            # CLOSE SOURCE CONNECTION
+            # 15. CLOSE SOURCE
             # -----------------------------------------------------
+            if source_connected:
+                try:
+                    source_connector.close()
+                except Exception as exc:
+                    logger.warning(
+                        "Source connection cleanup failed | "
+                        "exception_type=%s",
+                        type(exc).__name__,
+                    )
 
-            # Always release the source database connection.
-            try:
-                source_connector.close()
-            except Exception:
-                # Connection cleanup should not hide an execution
-                # exception that may already be in progress.
-                pass
+    # =============================================================
+    # DATATYPE COMPATIBILITY HELPERS
+    # =============================================================
+
+    @staticmethod
+    def _get_type_family(data_type: str) -> str | None:
+        """
+        Classify supported PostgreSQL and SQL Server data types.
+
+        Unknown types return None and are rejected until explicitly
+        supported by a compatibility rule.
+        """
+        if not isinstance(data_type, str) or not data_type.strip():
+            return None
+
+        normalized = " ".join(data_type.strip().lower().split())
+
+        type_families = {
+            "string": {
+                "text",
+                "character varying",
+                "varchar",
+                "character",
+                "char",
+                "nvarchar",
+                "nchar",
+                "ntext",
+                "national character varying",
+                "national character",
+            },
+            "integer": {
+                "smallint",
+                "integer",
+                "int",
+                "bigint",
+                "tinyint",
+                "smallserial",
+                "serial",
+                "bigserial",
+            },
+            "decimal": {
+                "numeric",
+                "decimal",
+                "money",
+                "smallmoney",
+            },
+            "float": {
+                "real",
+                "float",
+                "double precision",
+            },
+            "boolean": {
+                "boolean",
+                "bool",
+                "bit",
+            },
+            "date": {
+                "date",
+            },
+            "datetime": {
+                "timestamp",
+                "timestamp without time zone",
+                "timestamp with time zone",
+                "datetime",
+                "datetime2",
+                "smalldatetime",
+                "datetimeoffset",
+            },
+            "time": {
+                "time",
+                "time without time zone",
+                "time with time zone",
+            },
+            "binary": {
+                "bytea",
+                "binary",
+                "varbinary",
+                "image",
+            },
+            "uuid": {
+                "uuid",
+                "uniqueidentifier",
+            },
+        }
+
+        for family, supported_types in type_families.items():
+            if normalized in supported_types:
+                return family
+
+        return None
+
+    @staticmethod
+    def _are_types_compatible(
+        source_type: str,
+        target_type: str,
+    ) -> bool:
+        """
+        Check broad datatype-family compatibility.
+
+        This does not guarantee that values fit target length,
+        precision, scale, numeric range, or timezone semantics.
+        """
+        source_family = FullLoadExecutor._get_type_family(source_type)
+        target_family = FullLoadExecutor._get_type_family(target_type)
+
+        return (
+            source_family is not None
+            and source_family == target_family
+        )
+
+    # =============================================================
+    # PHYSICAL SCHEMA VALIDATION
+    # =============================================================
+
+    @staticmethod
+    def _validate_physical_schema(
+        source_connector: BaseConnector,
+        target_connector: BaseConnector,
+        source_object: Any,
+        target_object: Any,
+        source_columns: list[str],
+        target_columns: list[str],
+    ) -> None:
+        """
+        Validate mapped column existence and datatype compatibility.
+
+        This method must finish before the target is truncated.
+        """
+
+        # SOURCE SCHEMA
+        try:
+            source_metadata = source_connector.list_columns(
+                schema_name=source_object.schema_name,
+                table_name=source_object.object_name,
+            )
+        except Exception as exc:
+            raise SchemaValidationError(
+                "Unable to retrieve source table schema."
+            ) from exc
+
+        source_metadata_by_name = {
+            column["column_name"]: column
+            for column in source_metadata
+            if column.get("column_name")
+        }
+
+        missing_source_columns = [
+            column
+            for column in source_columns
+            if column not in source_metadata_by_name
+        ]
+
+        if missing_source_columns:
+            raise SchemaValidationError(
+                "Source schema validation failed. "
+                f"Missing source columns: {missing_source_columns}"
+            )
+
+        # TARGET SCHEMA
+        try:
+            target_metadata = target_connector.list_columns(
+                schema_name=target_object.schema_name,
+                table_name=target_object.object_name,
+            )
+        except Exception as exc:
+            raise SchemaValidationError(
+                "Unable to retrieve target table schema."
+            ) from exc
+
+        target_metadata_by_name = {
+            column["column_name"]: column
+            for column in target_metadata
+            if column.get("column_name")
+        }
+
+        missing_target_columns = [
+            column
+            for column in target_columns
+            if column not in target_metadata_by_name
+        ]
+
+        if missing_target_columns:
+            raise SchemaValidationError(
+                "Target schema validation failed. "
+                f"Missing target columns: {missing_target_columns}"
+            )
+
+        # MAPPING VALIDATION
+        if len(source_columns) != len(target_columns):
+            raise SchemaValidationError(
+                "Source and target mapping counts do not match."
+            )
+
+        # DATATYPE VALIDATION: FL-010
+        for source_column, target_column in zip(
+            source_columns,
+            target_columns,
+        ):
+            source_column_metadata = source_metadata_by_name[
+                source_column
+            ]
+            target_column_metadata = target_metadata_by_name[
+                target_column
+            ]
+
+            source_type = source_column_metadata.get("data_type")
+            target_type = target_column_metadata.get("data_type")
+
+            if not isinstance(source_type, str) or not source_type.strip():
+                raise SchemaValidationError(
+                    "Source datatype metadata is missing or invalid. "
+                    f"Source column='{source_column}'."
+                )
+
+            if not isinstance(target_type, str) or not target_type.strip():
+                raise SchemaValidationError(
+                    "Target datatype metadata is missing or invalid. "
+                    f"Target column='{target_column}'."
+                )
+
+            if not FullLoadExecutor._are_types_compatible(
+                source_type,
+                target_type,
+            ):
+                raise SchemaValidationError(
+                    "Source-to-target datatype mismatch or unsupported "
+                    "datatype. "
+                    f"Source column='{source_column}' "
+                    f"(type='{source_type}'), "
+                    f"Target column='{target_column}' "
+                    f"(type='{target_type}'). "
+                    "The load was stopped before target TRUNCATE."
+                )
+
+            logger.debug(
+                "Datatype validation passed | source_column=%s | "
+                "source_type=%s | target_column=%s | target_type=%s",
+                source_column,
+                source_type,
+                target_column,
+                target_type,
+            )
+
+    # =============================================================
+    # SQL IDENTIFIER QUOTING
+    # =============================================================
 
     @staticmethod
     def _quote_identifier(identifier: str) -> str:
-        """
-        Safely quote a SQL identifier for the current PostgreSQL POC.
-
-        WHY
-        ---
-        Schema, table, and column names come from metadata.
-
-        They must therefore be treated as SQL identifiers rather than
-        SQL values.
-
-        Example
-        -------
-        customer_id
-            becomes
-        "customer_id"
-
-        This prevents malformed SQL when identifiers contain special
-        characters and keeps identifier handling separate from value
-        parameterization.
-        """
-
-        # Validate that the identifier contains a usable value.
+        """Quote an SQL identifier using double quotes."""
         if not identifier or not identifier.strip():
-            raise ValueError(
-                "SQL identifier must not be empty."
-            )
+            raise ValueError("SQL identifier must not be empty.")
 
-        # Remove accidental surrounding whitespace.
         identifier = identifier.strip()
+        escaped_identifier = identifier.replace('"', '""')
 
-        # Escape embedded double quotes according to PostgreSQL
-        # identifier rules.
-        escaped_identifier = identifier.replace(
-            '"',
-            '""',
-        )
-
-        # Return the safely quoted identifier.
         return f'"{escaped_identifier}"'

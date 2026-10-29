@@ -107,6 +107,11 @@ class DemoSecretProvider(SecretProvider):
         # that may already use this reference.
         "secret/demo/postgresql/password":
             "MDIP_DEMO_POSTGRES_PASSWORD",
+         # SQL Server development reference.
+         "SQLSERVER_DEV_SECRET": "MDIP_DEMO_SQLSERVER_PASSWORD",
+
+         # Existing metadata reference for credential ID 6.
+         "secret_postgres": "MDIP_DEMO_POSTGRES_PASSWORD",
     }
 
     # -------------------------------------------------------------

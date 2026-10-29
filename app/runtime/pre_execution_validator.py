@@ -1,160 +1,125 @@
 """
 Runtime Pre-Execution Validator
+===============================
 
-Purpose
--------
-Performs read-only physical validation before the ingestion engine is
-allowed to modify the target.
+Performs read-only physical validation of source and target objects before
+the ingestion engine is allowed to modify the target.
 
-The validator receives a fully resolved RuntimeExecutionContext containing:
+The validator uses metadata-resolved field mappings instead of hardcoded
+column names.
 
-    - Runtime execution plan
-    - Source physical object
-    - Target physical object
-    - Source connector
-    - Target connector
-
-The validator checks:
-
-    1. Source connection can be established.
-    2. Target connection can be established.
-    3. Source table exists.
-    4. Target table exists.
-    5. Source columns are available.
-    6. Target columns are available.
-    7. Source and target columns match the expected mapping.
-
-Important
----------
-This validator is READ ONLY.
-
-It does NOT:
-
-    - truncate the target
-    - insert rows
-    - update rows
-    - delete rows
-    - create tables
-    - alter tables
-    - modify metadata
-
-Physical connections are closed after validation.
+Important:
+    - Does not truncate or write target data.
+    - May create a missing target table when its metadata policy allows it.
+    - Never alters or drops an existing physical table.
+    - Does not modify metadata.
+    - Closes physical connections after validation.
 """
 
 from dataclasses import dataclass
 
 from app.runtime.execution_context import RuntimeExecutionContext
+from app.runtime.models import RuntimeFieldMapping
+from app.runtime.schema_comparison import compare_column_metadata
 
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """
-    Represents the result of one pre-execution validation check.
+    """Result of one pre-execution validation check."""
 
-    A structured result is used instead of returning only True/False so
-    that the execution layer can later expose useful operational evidence.
-    """
-
-    # Human-readable name of the validation check.
     check_name: str
-
-    # Whether the validation succeeded.
     passed: bool
-
-    # Additional information explaining the result.
     message: str
 
 
 class PreExecutionValidator:
-    """
-    Performs read-only validation against the physical source and target.
-
-    The validator deliberately receives a RuntimeExecutionContext instead
-    of resolving metadata itself.
-
-    This maintains the separation:
-
-        Metadata Resolution
-                ↓
-        Runtime Context
-                ↓
-        Pre-Execution Validation
-                ↓
-        Data Execution
-    """
+    """Validate physical source and target objects using field mappings."""
 
     def validate(
         self,
         context: RuntimeExecutionContext,
+        field_mappings: list[RuntimeFieldMapping] | None = None,
     ) -> list[ValidationResult]:
         """
-        Execute all pre-load validation checks.
+        Run read-only validation checks for one runtime execution context.
 
-        Parameters
-        ----------
-        context:
-            Fully resolved runtime execution context.
+        Args:
+            context:
+                Fully resolved runtime execution context.
+            field_mappings:
+                Source-to-target mappings resolved from metadata.
 
-        Returns
-        -------
-        list[ValidationResult]
-            Individual validation results.
+        Returns:
+            A list of successful validation results.
 
-        Raises
-        ------
-        Exception
-            Physical connection or validation failures are propagated to
-            the caller so that execution cannot continue accidentally.
+        Raises:
+            ValueError:
+                If mappings or execution configuration are invalid.
+            LookupError:
+                If a physical object or mapped column is missing.
         """
 
-        # Store individual validation results so the caller can display
-        # exactly which checks passed.
+        # --------------------------------------------------------------
+        # FIELD MAPPING VALIDATION
+        # --------------------------------------------------------------
+
+        if not field_mappings:
+            raise ValueError(
+                "Field mappings are required for pre-execution validation."
+            )
+
+        ordered_mappings = sorted(
+            field_mappings,
+            key=lambda mapping_item: mapping_item.ordinal_no,
+        )
+
+        expected_source_columns = [
+            mapping.source_field_name
+            for mapping in ordered_mappings
+        ]
+
+        expected_target_columns = [
+            mapping.target_field_name
+            for mapping in ordered_mappings
+        ]
+
+        if any(not column for column in expected_source_columns):
+            raise ValueError(
+                "Field mappings contain an empty source column name."
+            )
+
+        if any(not column for column in expected_target_columns):
+            raise ValueError(
+                "Field mappings contain an empty target column name."
+            )
+
+        if len(expected_source_columns) != len(set(expected_source_columns)):
+            raise ValueError(
+                "Field mappings contain duplicate source column names."
+            )
+
+        if len(expected_target_columns) != len(set(expected_target_columns)):
+            raise ValueError(
+                "Field mappings contain duplicate target column names."
+            )
+
         results: list[ValidationResult] = []
 
         # --------------------------------------------------------------
-        # SOURCE VALIDATION
+        # SOURCE OBJECT VALIDATION
         # --------------------------------------------------------------
 
-        # Retrieve the source connector from the already resolved context.
         source_connector = context.source_connector
-
-        # Retrieve the source physical object.
         source_object = context.source_object
 
-        # Connect to the source database.
-        #
-        # This is the first point in our runtime flow where a physical
-        # database connection is intentionally opened.
-        source_connection = source_connector.connect()
+        source_connector.connect()
 
         try:
-            # Validate that the expected source object exists.
-            #
-            # We use information_schema because it provides a standard
-            # metadata interface for PostgreSQL and many relational
-            # database connectors can implement equivalent logic later.
-            source_query = """
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_catalog = %s
-                  AND table_schema = %s
-                  AND table_name = %s
-                LIMIT 1;
-            """
+            source_table_exists = source_connector.table_exists(
+                source_object.schema_name,
+                source_object.object_name,
+            )
 
-            with source_connection.cursor() as cursor:
-                cursor.execute(
-                    source_query,
-                    (
-                        source_connector.metadata.database_name,
-                        source_object.schema_name,
-                        source_object.object_name,
-                    ),
-                )
-
-                source_table_exists = cursor.fetchone() is not None
-
-            # Stop execution if the source table does not exist.
             if not source_table_exists:
                 raise LookupError(
                     "Source table was not found: "
@@ -163,7 +128,6 @@ class PreExecutionValidator:
                     f"{source_object.object_name}"
                 )
 
-            # Record the successful source-object validation.
             results.append(
                 ValidationResult(
                     check_name="SOURCE_OBJECT_EXISTS",
@@ -178,36 +142,14 @@ class PreExecutionValidator:
             )
 
             # ----------------------------------------------------------
-            # SOURCE COLUMN VALIDATION
+            # SOURCE MAPPED-COLUMN VALIDATION
             # ----------------------------------------------------------
-            #
-            # Retrieve source columns in ordinal order.
-            source_columns_query = """
-                SELECT
-                    column_name,
-                    data_type,
-                    is_nullable,
-                    ordinal_position
-                FROM information_schema.columns
-                WHERE table_catalog = %s
-                  AND table_schema = %s
-                  AND table_name = %s
-                ORDER BY ordinal_position;
-            """
 
-            with source_connection.cursor() as cursor:
-                cursor.execute(
-                    source_columns_query,
-                    (
-                        source_connector.metadata.database_name,
-                        source_object.schema_name,
-                        source_object.object_name,
-                    ),
-                )
+            source_columns = source_connector.list_columns(
+                source_object.schema_name,
+                source_object.object_name,
+            )
 
-                source_columns = cursor.fetchall()
-
-            # A source table without columns cannot be loaded.
             if not source_columns:
                 raise LookupError(
                     "Source table contains no columns: "
@@ -215,22 +157,11 @@ class PreExecutionValidator:
                     f"{source_object.object_name}"
                 )
 
-            # Convert the database result into a simple ordered list of
-            # column names for validation.
             source_column_names = [
-                row[0]
-                for row in source_columns
+                column["column_name"]
+                for column in source_columns
             ]
 
-            # The Customer POC mapping expects these four source columns.
-            expected_source_columns = [
-                "customer_id",
-                "customer_name",
-                "email",
-                "city",
-            ]
-
-            # Validate that every expected source field exists.
             missing_source_columns = [
                 column
                 for column in expected_source_columns
@@ -239,78 +170,132 @@ class PreExecutionValidator:
 
             if missing_source_columns:
                 raise LookupError(
-                    "Required source columns are missing: "
+                    "Mapped source columns are missing: "
                     f"{missing_source_columns}"
                 )
 
-            # Record the successful source-column validation.
             results.append(
                 ValidationResult(
                     check_name="SOURCE_COLUMNS",
                     passed=True,
                     message=(
-                        "Required source columns are available: "
+                        "All mapped source columns are available: "
                         f"{expected_source_columns}"
                     ),
                 )
             )
 
         finally:
-            # Always close the source connector after validation.
-            #
-            # This guarantees that the pre-execution validator does not
-            # leave an unused physical database connection open.
+            # Always close the source connection.
             source_connector.close()
 
         # --------------------------------------------------------------
-        # TARGET VALIDATION
+        # TARGET OBJECT VALIDATION
         # --------------------------------------------------------------
 
-        # Retrieve the target connector from the resolved context.
         target_connector = context.target_connector
-
-        # Retrieve the target physical object.
         target_object = context.target_object
+        target_config = context.execution_plan.target_config
 
-        # Connect to the target database.
-        target_connection = target_connector.connect()
+        target_connector.connect()
 
         try:
-            # Validate that the target table already exists.
-            #
-            # Auto-create-target is currently FALSE in the Customer POC,
-            # so the target must already exist.
-            target_query = """
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_catalog = %s
-                  AND table_schema = %s
-                  AND table_name = %s
-                LIMIT 1;
-            """
+            target_table_exists = target_connector.table_exists(
+                target_object.schema_name,
+                target_object.object_name,
+            )
 
-            with target_connection.cursor() as cursor:
-                cursor.execute(
-                    target_query,
-                    (
-                        target_connector.metadata.database_name,
+            if not target_table_exists:
+                if (
+                    not target_config.auto_create_target
+                    or target_config.target_schema_policy_code
+                    != "CREATE_IF_MISSING"
+                ):
+                    raise LookupError(
+                        "Target table was not found and target-load "
+                        "metadata does not permit creation: "
+                        f"{target_object.catalog_name}."
+                        f"{target_object.schema_name}."
+                        f"{target_object.object_name}"
+                    )
+
+                if type(source_connector) is not type(target_connector):
+                    raise ValueError(
+                        "Automatic target-table creation requires matching "
+                        "source and target connector implementations; a "
+                        "configured cross-database datatype mapping is "
+                        "required otherwise."
+                    )
+
+                source_columns_by_name = {
+                    column["column_name"]: column
+                    for column in source_columns
+                }
+                target_column_definitions = []
+                for ordinal, mapping in enumerate(
+                    ordered_mappings,
+                    start=1,
+                ):
+                    source_column = source_columns_by_name.get(
+                        mapping.source_field_name
+                    )
+                    if source_column is None:
+                        raise LookupError(
+                            "Cannot create target table because mapped "
+                            "source column is missing: "
+                            f"{mapping.source_field_name}"
+                        )
+
+                    target_column = dict(source_column)
+                    target_column["column_name"] = (
+                        mapping.target_field_name
+                    )
+                    target_column["ordinal_position"] = ordinal
+                    target_column_definitions.append(target_column)
+
+                target_connector.begin_transaction()
+                try:
+                    target_connector.create_table(
                         target_object.schema_name,
                         target_object.object_name,
-                    ),
-                )
+                        target_column_definitions,
+                    )
 
-                target_table_exists = cursor.fetchone() is not None
+                    # Refresh metadata after DDL and validate before
+                    # committing the new table.
+                    target_table_exists = target_connector.table_exists(
+                        target_object.schema_name,
+                        target_object.object_name,
+                    )
+                    if not target_table_exists:
+                        raise RuntimeError(
+                            "Target connector did not create the configured "
+                            "target table."
+                        )
 
-            # The target must exist because auto-create is disabled.
-            if not target_table_exists:
-                raise LookupError(
-                    "Target table was not found: "
-                    f"{target_object.catalog_name}."
-                    f"{target_object.schema_name}."
-                    f"{target_object.object_name}"
-                )
+                    created_target_columns = (
+                        target_connector.list_columns(
+                            target_object.schema_name,
+                            target_object.object_name,
+                        )
+                    )
+                    creation_differences = compare_column_metadata(
+                        source_columns,
+                        created_target_columns,
+                        include_defaults=False,
+                    )
+                    if creation_differences:
+                        raise ValueError(
+                            "Created target schema does not match the "
+                            "source schema: "
+                            + "; ".join(creation_differences)
+                        )
 
-            # Record successful target-object validation.
+                    target_connector.commit()
+                except Exception:
+                    target_connector.rollback()
+                    raise
+
             results.append(
                 ValidationResult(
                     check_name="TARGET_OBJECT_EXISTS",
@@ -325,36 +310,14 @@ class PreExecutionValidator:
             )
 
             # ----------------------------------------------------------
-            # TARGET COLUMN VALIDATION
+            # TARGET MAPPED-COLUMN VALIDATION
             # ----------------------------------------------------------
 
-            # Retrieve target columns in ordinal order.
-            target_columns_query = """
-                SELECT
-                    column_name,
-                    data_type,
-                    is_nullable,
-                    ordinal_position
-                FROM information_schema.columns
-                WHERE table_catalog = %s
-                  AND table_schema = %s
-                  AND table_name = %s
-                ORDER BY ordinal_position;
-            """
+            target_columns = target_connector.list_columns(
+                target_object.schema_name,
+                target_object.object_name,
+            )
 
-            with target_connection.cursor() as cursor:
-                cursor.execute(
-                    target_columns_query,
-                    (
-                        target_connector.metadata.database_name,
-                        target_object.schema_name,
-                        target_object.object_name,
-                    ),
-                )
-
-                target_columns = cursor.fetchall()
-
-            # A target without columns cannot receive data.
             if not target_columns:
                 raise LookupError(
                     "Target table contains no columns: "
@@ -362,22 +325,11 @@ class PreExecutionValidator:
                     f"{target_object.object_name}"
                 )
 
-            # Convert the result into an ordered column-name list.
             target_column_names = [
-                row[0]
-                for row in target_columns
+                column["column_name"]
+                for column in target_columns
             ]
 
-            # The Customer target was created from the same four mapped
-            # fields.
-            expected_target_columns = [
-                "customer_id",
-                "customer_name",
-                "email",
-                "city",
-            ]
-
-            # Validate that every required target field exists.
             missing_target_columns = [
                 column
                 for column in expected_target_columns
@@ -386,106 +338,76 @@ class PreExecutionValidator:
 
             if missing_target_columns:
                 raise LookupError(
-                    "Required target columns are missing: "
+                    "Mapped target columns are missing: "
                     f"{missing_target_columns}"
                 )
 
-            # Record successful target-column validation.
             results.append(
                 ValidationResult(
                     check_name="TARGET_COLUMNS",
                     passed=True,
                     message=(
-                        "Required target columns are available: "
+                        "All mapped target columns are available: "
                         f"{expected_target_columns}"
                     ),
                 )
             )
 
-            # ----------------------------------------------------------
-            # COLUMN ORDER VALIDATION
-            # ----------------------------------------------------------
-            #
-            # The current Customer POC uses direct one-to-one mapping.
-            #
-            # Therefore the source and target columns should appear in the
-            # same logical order.
-            #
-            # Later, the generic mapping engine will use mapping_field
-            # metadata instead of relying on physical ordinal order.
-            if (
-                source_column_names
-                != target_column_names
-            ):
-                raise ValueError(
-                    "Source and target column order does not match. "
-                    f"Source={source_column_names}, "
-                    f"Target={target_column_names}"
-                )
-
-            # Record successful column-order validation.
+            schema_differences = compare_column_metadata(
+                source_columns,
+                target_columns,
+                include_defaults=False,
+            )
             results.append(
                 ValidationResult(
-                    check_name="COLUMN_ORDER",
-                    passed=True,
+                    check_name="SCHEMA_METADATA_MATCH",
+                    passed=not schema_differences,
                     message=(
-                        "Source and target column order matches."
+                        "; ".join(schema_differences)
+                        if schema_differences
+                        else (
+                            "Source and target column metadata match "
+                            "(names, order, types, nullability, precision, "
+                            "scale, defaults, and supported attributes)."
+                        )
                     ),
                 )
             )
 
         finally:
-            # Always close the target connector after validation.
+            # Always close the target connection.
             target_connector.close()
 
         # --------------------------------------------------------------
         # EXECUTION CONFIGURATION VALIDATION
         # --------------------------------------------------------------
 
-        # Retrieve the resolved mapping configuration.
         mapping = context.execution_plan.mapping
-
-        # Retrieve the resolved load configuration.
         load_config = context.execution_plan.load_config
-
-        # Retrieve the resolved target configuration.
         target_config = context.execution_plan.target_config
 
-        # Validate the current Customer POC load type.
         if mapping.load_type_code != "FULL":
             raise ValueError(
-                "Pre-execution validator currently supports "
-                f"FULL load only, received: {mapping.load_type_code}"
+                "Pre-execution validator currently supports FULL load only, "
+                f"received: {mapping.load_type_code}"
             )
 
-        # Validate the current Customer POC load strategy.
         if mapping.load_strategy_code != "TRUNCATE_INSERT":
             raise ValueError(
-                "Pre-execution validator currently supports "
-                "TRUNCATE_INSERT only, received: "
-                f"{mapping.load_strategy_code}"
+                "Pre-execution validator currently supports TRUNCATE_INSERT "
+                f"only, received: {mapping.load_strategy_code}"
             )
 
-        # Validate the configured batch size.
         if load_config.batch_size <= 0:
             raise ValueError(
                 "Batch size must be greater than zero."
             )
 
-        # Validate that the load configuration is active.
         if not load_config.is_active:
             raise ValueError(
                 "Load configuration is inactive."
             )
 
-        # Auto-create is disabled for this POC, so the target object must
-        # already have been validated above.
-        if target_config.auto_create_target:
-            raise ValueError(
-                "Customer POC expects auto_create_target=False."
-            )
-
-        # Record successful execution configuration validation.
         results.append(
             ValidationResult(
                 check_name="EXECUTION_CONFIGURATION",
@@ -496,5 +418,4 @@ class PreExecutionValidator:
             )
         )
 
-        # Return every successful validation result.
         return results

@@ -1,121 +1,61 @@
+
 """
 Connector Registration
 ======================
 
-This module registers all certified database connectors that are
-available to the Metadata-Driven Data Ingestion Platform.
+Purpose
+-------
+Register supported database connector implementations centrally.
 
-WHY THIS FILE EXISTS
---------------------
+Why
+---
+The ConnectorFactory uses connector codes from metadata to select
+the correct connector without hardcoding vendor logic in the executor.
 
-The ingestion engine should NOT contain database-specific logic.
-
-For example, we do NOT want:
-
-    if connector == "POSTGRESQL":
-        ...
-    elif connector == "MYSQL":
-        ...
-
-Instead, connectors are registered centrally here.
-
-The metadata database provides a connector code such as:
-
-    POSTGRESQL_CONNECTOR
-
-The registry maps that code to the corresponding Python
-implementation:
-
-    POSTGRESQL_CONNECTOR
-            |
-            v
-    PostgreSQLConnector
-
-
-FUTURE CONNECTORS
------------------
-
-Additional connectors can be registered here without changing
-the ingestion engine.
-
-Examples:
-
-    MYSQL_CONNECTOR
-    SQLSERVER_CONNECTOR
-    ORACLE_CONNECTOR
-    SNOWFLAKE_CONNECTOR
-    DATABRICKS_CONNECTOR
+Current registrations:
+    POSTGRESQL_CONNECTOR -> PostgreSQLConnector
+    SQLSERVER_CONNECTOR  -> SQLServerConnector
 """
 
+# Import the central registry used to store connector implementations.
 from app.connectors.registry import ConnectorRegistry
+
+# Import the existing PostgreSQL connector.
 from app.connectors.postgres.adapter import PostgreSQLConnector
+
+# Import the new SQL Server connector.
+from app.connectors.sqlserver.adapter import SQLServerConnector
 
 
 def create_connector_registry() -> ConnectorRegistry:
     """
-    Create and configure the application connector registry.
+    Create and return the registry containing supported connectors.
 
     Returns
     -------
     ConnectorRegistry
-        Registry containing all certified connectors available
-        to the application.
-
-    WHY
-    ---
-    The registry provides a central mapping between the connector
-    code stored in metadata and the Python connector implementation.
-
-    Currently supported:
-
-        POSTGRESQL_CONNECTOR
-            |
-            v
-        PostgreSQLConnector
-
-    As new connectors are developed, they can be registered here.
+        Registry mapping metadata connector codes to Python classes.
     """
 
-    # =========================================================
-    # CREATE EMPTY REGISTRY
-    # =========================================================
-    #
-    # The registry initially contains no connectors.
-    # =========================================================
-
+    # Create an empty registry before registering implementations.
     registry = ConnectorRegistry()
 
-    # =========================================================
-    # REGISTER POSTGRESQL CONNECTOR
-    # =========================================================
-    #
-    # The connector code MUST match the connector_code stored
-    # in the metadata database.
-    #
-    # Example:
-    #
-    #     conn.connector.connector_code
-    #
-    # should contain:
-    #
-    #     POSTGRESQL_CONNECTOR
-    #
-    # The registry then resolves that code to:
-    #
-    #     PostgreSQLConnector
-    # =========================================================
+    # Preserve the existing PostgreSQL connector registration.
+    registry.register(
+    "POSTGRESQL",
+       PostgreSQLConnector,
+   )
 
     registry.register(
-        "POSTGRESQL_CONNECTOR",
+       "POSTGRESQL_CONNECTOR",
         PostgreSQLConnector,
+   )
+
+    # Register SQL Server using the exact connector code stored in metadata.
+    registry.register(
+        "SQL_SERVER_CONNECTOR",
+        SQLServerConnector,
     )
 
-    # =========================================================
-    # RETURN CONFIGURED REGISTRY
-    # =========================================================
-    #
-    # The ConnectorFactory will use this registry to dynamically
-    # create the appropriate connector.
-    # =========================================================
-
+    # Return the configured registry for use by ConnectorFactory.
     return registry

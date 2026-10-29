@@ -174,6 +174,16 @@ class BaseConnector(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    def list_columns(
+        self,
+        schema_name: str,
+        table_name: str,
+    ) -> list[dict[str, Any]]:
+        """Return ordered column metadata for a physical table."""
+
+        raise NotImplementedError
+
     # =========================================================
     # BATCH DATA READING
     # =========================================================
@@ -326,9 +336,77 @@ class BaseConnector(ABC):
 
         raise NotImplementedError
 
+        # =========================================================
+    # ROW COUNT RECONCILIATION
+    # =========================================================
+
+    @abstractmethod
+    def count_rows(
+        self,
+        schema_name: str,
+        table_name: str,
+    ) -> int:
+        """
+        Return the current number of rows in a physical table.
+
+        Implementations must safely quote schema and table
+        identifiers and must not commit the current transaction.
+        """
+        raise NotImplementedError
+
     # =========================================================
     # TARGET TABLE PREPARATION
     # =========================================================
+    
+   
+    @abstractmethod
+    def schema_exists(self, schema_name: str) -> bool:
+        """Return whether a schema exists."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def table_exists(
+        self,
+        schema_name: str,
+        table_name: str,
+    ) -> bool:
+        """Return whether a table exists in a schema."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_schema(self, schema_name: str) -> None:
+        """Create a target schema."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_table(
+        self,
+        schema_name: str,
+        table_name: str,
+        columns: list[dict[str, Any]],
+    ) -> None:
+        """Create a table from normalized column metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        column: dict[str, Any],
+    ) -> None:
+        """Add a column to an existing table from normalized metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def drop_column(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_name: str,
+    ) -> None:
+        """Drop a column from a table by its validated identifier."""
+        raise NotImplementedError
 
     @abstractmethod
     def truncate_table(
