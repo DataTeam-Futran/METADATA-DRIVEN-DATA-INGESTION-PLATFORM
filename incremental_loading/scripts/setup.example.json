@@ -1,0 +1,47 @@
+{
+  "tenant": {
+    "code": "YOUR_TENANT_CODE",
+    "name": "Your Tenant",
+    "description": "Tenant for the PostgreSQL data-ingestion setup"
+  },
+  "project": {
+    "code": "YOUR_PROJECT_CODE",
+    "name": "Your Data Ingestion Project",
+    "description": "PostgreSQL source-to-target project"
+  },
+  "environment": {
+    "code": "DEV",
+    "name": "Development",
+    "rank": 1
+  },
+  "system": {
+    "code": "POSTGRES_DEMO_SYSTEM",
+    "name": "PostgreSQL Demo System"
+  },
+  "source": {
+    "name": "Your PostgreSQL Source",
+    "host": "SOURCE_HOST",
+    "port": 5432,
+    "database": "SOURCE_DATABASE",
+    "schema": "public",
+    "username": "SOURCE_USERNAME",
+    "credential_name": "PostgreSQL Source Credential",
+    "secret_env_var": "MDIP_DB_SECRET_SOURCE",
+    "sslmode": "prefer",
+    "connect_timeout_seconds": 10,
+    "command_timeout_seconds": 600
+  },
+  "target": {
+    "name": "Your PostgreSQL Target",
+    "host": "TARGET_HOST",
+    "port": 5432,
+    "database": "TARGET_DATABASE",
+    "schema": "public",
+    "username": "TARGET_USERNAME",
+    "credential_name": "PostgreSQL Target Credential",
+    "secret_env_var": "MDIP_DB_SECRET_TARGET",
+    "sslmode": "prefer",
+    "connect_timeout_seconds": 10,
+    "command_timeout_seconds": 600
+  }
+}
