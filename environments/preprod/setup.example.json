@@ -1,0 +1,47 @@
+{
+  "tenant": {
+    "code": "YOUR_TENANT_CODE",
+    "name": "Your Tenant",
+    "description": "Tenant for PRE-PROD validation"
+  },
+  "project": {
+    "code": "MDIP_PREPROD",
+    "name": "Metadata-Driven Data Ingestion PRE-PROD",
+    "description": "PRE-PROD connection profiles for solution validation"
+  },
+  "environment": {
+    "code": "PREPROD",
+    "name": "Pre-Production",
+    "rank": 2
+  },
+  "system": {
+    "code": "POSTGRES_PREPROD_SYSTEM",
+    "name": "PRE-PROD PostgreSQL System"
+  },
+  "source": {
+    "name": "PRE-PROD Source",
+    "host": "PREPROD_SOURCE_HOST",
+    "port": 5432,
+    "database": "PREPROD_SOURCE_DATABASE",
+    "schema": "public",
+    "username": "PREPROD_SOURCE_USERNAME",
+    "credential_name": "PRE-PROD Source Credential",
+    "secret_env_var": "MDIP_DB_SECRET_PREPROD_SOURCE",
+    "sslmode": "verify-full",
+    "connect_timeout_seconds": 10,
+    "command_timeout_seconds": 600
+  },
+  "target": {
+    "name": "PRE-PROD Target",
+    "host": "PREPROD_TARGET_HOST",
+    "port": 5432,
+    "database": "PREPROD_TARGET_DATABASE",
+    "schema": "public",
+    "username": "PREPROD_TARGET_USERNAME",
+    "credential_name": "PRE-PROD Target Credential",
+    "secret_env_var": "MDIP_DB_SECRET_PREPROD_TARGET",
+    "sslmode": "verify-full",
+    "connect_timeout_seconds": 10,
+    "command_timeout_seconds": 600
+  }
+}
