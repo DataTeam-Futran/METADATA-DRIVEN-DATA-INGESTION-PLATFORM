@@ -91,10 +91,19 @@ from dotenv import load_dotenv
 #
 # Production environments should provide these values through
 # environment variables or an approved secrets management
-# mechanism.
+# mechanism. Set MDIP_ENV_FILE to select an environment-specific
+# local file without falling back to the default .env file.
 # =============================================================
 
-load_dotenv()
+def _load_environment() -> None:
+    environment_file = os.getenv("MDIP_ENV_FILE")
+    if environment_file:
+        load_dotenv(dotenv_path=environment_file, override=True)
+    else:
+        load_dotenv()
+
+
+_load_environment()
 
 
 # =============================================================
